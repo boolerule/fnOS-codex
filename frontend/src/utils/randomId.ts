@@ -6,8 +6,6 @@
  * 背景：`crypto.randomUUID` 是**安全上下文（secure context）专属** API —— 通过
  * 明文 HTTP + LAN 地址或域名访问控制台时，该方法是 `undefined`，
  * 直接 `crypto.randomUUID()` 会抛 `TypeError`。
- * 控制台页面由 `admin.go` 直接提供、不经 `proxy.go` 的反代注入（那里只对 dsh
- * 页面注入 polyfill），因此这里必须自带兜底。
  *
  * `crypto.getRandomValues` 不受安全上下文限制，故优先用它自行拼装 UUID；
  * 仅当它也不可用时才退化为时间戳 + 随机数（非加密强度，但足以做本地 key）。

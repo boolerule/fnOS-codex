@@ -28,7 +28,7 @@ export interface FnosAuthReturn {
 }
 
 /** sessionStorage 里待校验的 state（同一次 WebView 内跨整页跳转仍然有效）。 */
-const AUTH_STATE_KEY = 'harness:fnos-app-auth-state'
+const AUTH_STATE_KEY = 'codex:fnos-app-auth-state'
 
 /** 授权页回传、需要从控制台 URL 上清理掉的参数。 */
 const AUTH_RETURN_PARAMS = ['status', 'method', 'appName', 'state', 'path', 'error'] as const
@@ -64,7 +64,7 @@ export function fnosAuthBase(): string {
 export function fnosAuthReturnURL(): string {
   // document.baseURI 由后端注入的 <base href> 决定（运行时 baseurl），不能写死前缀。
   const url = new URL(document.baseURI)
-  url.searchParams.set('view', 'directory')
+  url.searchParams.set('view', 'overview')
   return url.toString()
 }
 

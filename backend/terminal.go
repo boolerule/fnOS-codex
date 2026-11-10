@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -63,12 +64,15 @@ var errNotOwner = errors.New("not session owner")
 // Session 是一个独立的 PTY 终端会话。输出实时镜像到临时历史文件（应用停止时
 // 整目录清除），浏览器断开只“解挂载”不杀会话，刷新后凭 id 重新挂载并回放历史。
 type Session struct {
-	id    string
-	renv  *RuntimeEnv
-	cmd   *exec.Cmd
-	pty   *os.File
-	hist  *os.File
-	start time.Time
+	id        string
+	user      string
+	workspace string
+	mode      string
+	done      chan struct{}
+	cmd       *exec.Cmd
+	pty       *os.File
+	hist      *os.File
+	start     time.Time
 
 	// histMu 串行化“追加历史 + 广播到已挂载连接”：回放历史与实时追加在同一把
 	// 锁内完成，保证不存在重复或丢失的字节。
@@ -137,7 +141,7 @@ func (s *Session) pump() {
 			c := s.conn
 			s.connMu.Unlock()
 			if c != nil {
-				if werr := writeFrame(c, wsFrame(opText, chunk)); werr != nil {
+				if werr := writeFrame(c, wsFrame(opBin, chunk)); werr != nil {
 					// 写不动就不写了：摘掉并关闭它，别让它继续占着 histMu。
 					s.dropConn(c, werr)
 				}
@@ -148,16 +152,19 @@ func (s *Session) pump() {
 			break
 		}
 	}
-	s.markExited()
+	_ = s.cmd.Wait()
+	_ = s.pty.Close()
+	defer close(s.done)
 	// 进程退出后补一条提示帧与退出控制帧（若还有连接在挂载）
 	s.histMu.Lock()
+	s.markExited()
 	note := []byte("\r\n\x1b[31m[process exited]\x1b[0m\r\n")
 	s.appendHistoryLocked(note)
 	s.connMu.Lock()
 	c := s.conn
 	s.connMu.Unlock()
 	if c != nil {
-		if werr := writeFrame(c, wsFrame(opText, note)); werr == nil {
+		if werr := writeFrame(c, wsFrame(opBin, note)); werr == nil {
 			if werr = writeFrame(c, wsFrame(opText, []byte("\x1b]exit\x07"))); werr != nil {
 				s.dropConn(c, werr)
 			}
@@ -175,6 +182,10 @@ func (s *Session) pump() {
 // （/dev/ptmx 权限），pump 本体没法起，但这段纯文件逻辑可以。
 func (s *Session) appendHistoryLocked(chunk []byte) {
 	if s.hist == nil {
+		return
+	}
+	if _, err := s.hist.Seek(0, io.SeekEnd); err != nil {
+		logWarn("[terminal] session %s: seek history failed: %v", s.id, err)
 		return
 	}
 	if _, err := s.hist.Write(chunk); err != nil {
@@ -209,7 +220,7 @@ func (s *Session) trimHistoryLocked() {
 	keep := int64(maxHistoryBytes)
 	start := st.Size() - keep
 	buf := make([]byte, keep)
-	// ReadAt 不改文件游标；写入侧仍靠 O_APPEND 追加，两者互不干扰。
+	// ReadAt/WriteAt 不依赖回放留下的读游标。
 	if _, err := s.hist.ReadAt(buf, start); err != nil {
 		logWarn("[terminal] session %s: read history tail failed: %v", s.id, err)
 		return
@@ -218,8 +229,8 @@ func (s *Session) trimHistoryLocked() {
 		logWarn("[terminal] session %s: truncate history failed: %v", s.id, err)
 		return
 	}
-	// 文件是 O_APPEND 打开的，Truncate(0) 之后 Write 必然落在位置 0。
-	if _, err := s.hist.Write(buf); err != nil {
+	// 截断后从文件起点写回保留的尾部。
+	if _, err := s.hist.WriteAt(buf, 0); err != nil {
 		logWarn("[terminal] session %s: rewrite history tail failed: %v", s.id, err)
 	}
 }
@@ -234,6 +245,9 @@ func (s *Session) trimHistoryLocked() {
 func (s *Session) attach(c net.Conn) (net.Conn, error) {
 	s.histMu.Lock()
 	defer s.histMu.Unlock()
+	if s.isClosed() {
+		return nil, errors.New("session closed")
+	}
 	if s.hist != nil {
 		size, err := s.hist.Seek(0, io.SeekEnd)
 		if err == nil {
@@ -246,7 +260,7 @@ func (s *Session) attach(c net.Conn) (net.Conn, error) {
 				for {
 					n, rerr := s.hist.Read(chunk)
 					if n > 0 {
-						if werr := writeFrame(c, wsFrame(opText, chunk[:n])); werr != nil {
+						if werr := writeFrame(c, wsFrame(opBin, chunk[:n])); werr != nil {
 							return nil, werr
 						}
 					}
@@ -259,6 +273,11 @@ func (s *Session) attach(c net.Conn) (net.Conn, error) {
 	}
 	if err := writeFrame(c, wsFrame(opText, []byte("\x1b]ready\x07"))); err != nil {
 		return nil, err
+	}
+	if s.isExited() {
+		if err := writeFrame(c, wsFrame(opText, []byte("\x1b]exit\x07"))); err != nil {
+			return nil, err
+		}
 	}
 	// 换主与历史回放同处一个 histMu 临界区：新连接既不漏字节，也不与广播交叉。
 	s.connMu.Lock()
@@ -317,24 +336,32 @@ func (s *Session) close() error {
 	s.closed = true
 	s.mu.Unlock()
 
-	var firstErr error
-	if s.cmd != nil && s.cmd.Process != nil {
-		s.cmd.Process.Kill()
-		if err := s.cmd.Wait(); err != nil && firstErr == nil {
-			firstErr = err
-		}
+	if s.cmd != nil && s.cmd.Process != nil && !s.isExited() {
+		stopTerminalProcess(s.cmd.Process)
 	}
 	if s.pty != nil {
-		s.pty.Close()
+		_ = s.pty.Close()
 	}
+	if s.done != nil {
+		<-s.done
+	}
+	s.histMu.Lock()
+	defer s.histMu.Unlock()
+	s.connMu.Lock()
+	if s.conn != nil {
+		_ = s.conn.Close()
+		s.conn = nil
+	}
+	s.connMu.Unlock()
 	if s.hist != nil {
 		name := s.hist.Name()
-		s.hist.Close()
-		if err := os.Remove(name); err != nil && !os.IsNotExist(err) && firstErr == nil {
-			firstErr = err
+		_ = s.hist.Close()
+		s.hist = nil
+		if err := os.Remove(name); err != nil && !os.IsNotExist(err) {
+			return err
 		}
 	}
-	return firstErr
+	return nil
 }
 
 // SessionManager 管理全部活动会话。
@@ -342,76 +369,31 @@ type SessionManager struct {
 	renv     *RuntimeEnv
 	mu       sync.Mutex
 	sessions map[string]*Session
+	closing  bool
 }
 
 func NewSessionManager(renv *RuntimeEnv) *SessionManager {
 	return &SessionManager{renv: renv, sessions: map[string]*Session{}}
 }
 
-// terminalEnv builds the environment for the bash session: the harness process
-// environment is used as the base, then the app user's HOME/PATH and the
-// terminal-specific values are written over it in place.
-//
-// 这里刻意不注入代理设置：终端是用户自己的 shell，控制台的代理配置只服务于 dsh 与
-// harness 的对外请求（dsh 进程见 DshManager.buildEnv）。注入只会让控制台配置与平台
-// 自己导出的代理变量在同一份环境里并存，而 os.Environ() 本来就带着后者。
-//
-// 构造顺序很关键：os.Environ() 必须先铺底，再用 set() **原位覆盖**。os/exec 的
-// dedupEnv 对同名键是「最后一个生效」，反过来写（先显式值、后 append 环境）会让
-// LANG 的 UTF-8 兜底、TERM、SHELL 等被父进程的同名变量整体覆盖 —— dsh.go 的
-// buildEnv 用的就是这套「原位替换」写法，这里保持一致。
-func terminalEnv(renv *RuntimeEnv, home string) []string {
-	env := os.Environ()
-	set := func(kv string) {
-		key := kv[:strings.IndexByte(kv, '=')]
-		for i, e := range env {
-			if strings.HasPrefix(e, key+"=") {
-				env[i] = kv
-				return
-			}
-		}
-		env = append(env, kv)
+// Only pass settings needed by the CLI. The console process also has fnOS
+// gateway credentials and its own login secrets in its environment.
+func codexTerminalCommand(binary, home, cwd, mode string) (*exec.Cmd, error) {
+	var args []string
+	switch mode {
+	case "codex":
+		args = []string{"--sandbox", "workspace-write", "--ask-for-approval", "on-request"}
+	case "login":
+		args = []string{"login", "--device-auth"}
+		cwd = home
+	default:
+		return nil, errors.New("unsupported Codex session mode")
 	}
-	// HOME 解析失败（空）时不要写 HOME=""，否则 bash 会拿到一个空主目录，
-	// 保留父进程环境里的值更合理。
-	if home != "" {
-		set("HOME=" + home)
-		set("PWD=" + home)
-	}
-	// PATH = 稳定入口目录 + 启动时的平台 PATH。
-	//
-	// 稳定入口 ${数据目录}/server/.bin/dsh 指向当前选中版本（见 syncDshShim）：
-	// 终端会话的环境只在 spawn 时构造一次，切换版本不会重算，若直接沿用 renv.Path
-	// 里的旧 <版本>/node_modules/.bin，切完/删掉旧版本后终端里就没有 dsh 命令了。
-	// 这条目录恒定存在，符号链接由切换流程原子替换，**已经开着的会话**也能用上新版本。
-	pathVal := ""
-	if renv != nil {
-		pathVal = serverShimDirFor(renv)
-		if renv.Path != "" {
-			pathVal += ":" + renv.Path
-		}
-	}
-	set("PATH=" + pathVal)
-	set("TERM=xterm-256color")
-	set("LANG=" + localeLang(renv.Lang))
-	set("COLORTERM=truecolor")
-	set("PS1=\\u@\\h:\\w\\$ ")
-	set("SHELL=/bin/bash")
-	if renv.PnpmHome != "" {
-		set("PNPM_HOME=" + renv.PnpmHome)
-	}
-	return env
-}
-
-// effectiveHome 返回终端会话应使用的主目录：与 dsh 服务一致，恒为启动时解析出的 HOME
-// （主目录不可切换，见 DshManager.effectiveHome）。两者必须用同一份 HOME —— 否则在
-// 终端里执行 `dsh plugin --profile web …` 操作的是另一份 ~/.dsh，与 dsh 服务实际加载的
-// profile 不是同一个（现象：控制台/市场里改了插件，终端里看不到）。
-func (m *SessionManager) effectiveHome() string {
-	if m.renv != nil {
-		return m.renv.Home
-	}
-	return os.Getenv("HOME")
+	cmd := exec.Command(binary, args...)
+	cmd.Dir = cwd
+	cmd.Env = append(codexUserEnv(home), "PWD="+cwd, "SHELL=/bin/bash",
+		"LANG="+localeLang(os.Getenv("LANG")), "TERM=xterm-256color", "COLORTERM=truecolor")
+	return cmd, nil
 }
 
 func newID() string {
@@ -422,73 +404,78 @@ func newID() string {
 	return strings.ReplaceAll(time.Now().Format("20060102150405.000000000"), ".", "")
 }
 
-// sessionDir returns the temporary mirror directory: 已解析的运行时路径优先，
-// 否则退回统一数据目录下的 terminal-sessions。
-func (m *SessionManager) sessionDir() string {
-	if m.renv != nil && m.renv.SessionDir != "" {
-		return m.renv.SessionDir
+// Start the official CLI directly in a PTY. workspace has already been resolved
+// against the caller's current fnOS authorization by the HTTP entry point.
+func (m *SessionManager) create(user, workspace, mode, binary string) (*Session, error) {
+	if user == "" || m.renv.CodexHome == "" || m.renv.SessionDir == "" {
+		return nil, errors.New("missing Codex console session settings")
 	}
-	return dataPath("terminal-sessions")
-}
-
-// create 新建会话：生成 id、创建临时历史文件、启动 PTY 与 pump 协程。创建失败时
-// 返回错误并保证不残留文件。调用方随后应把 id 通过控制帧告知前端。
-func (m *SessionManager) create() (*Session, error) {
-	dir := m.sessionDir()
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return nil, err
-	}
-	id := newID()
-	fname := filepath.Join(dir, id+".log")
-	// 必须以可读可写打开：pump 追加写（O_APPEND），attach 回放读。
-	hist, err := os.OpenFile(fname, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o600)
+	home, err := filepath.Abs(filepath.Join(m.renv.CodexHome, user))
 	if err != nil {
 		return nil, err
 	}
-	cmd := exec.Command("/bin/bash")
-	// 用「当前生效的主目录」（跟随资源页的切换），与 dsh 服务保持一致。
-	home := m.effectiveHome()
-	if home != "" {
-		cmd.Dir = home
+	cmd, err := codexTerminalCommand(binary, home, workspace, mode)
+	if err != nil {
+		return nil, err
 	}
-	cmd.Env = terminalEnv(m.renv, home)
-	f, err := pty.Start(cmd)
+	if err := os.MkdirAll(filepath.Join(home, ".codex"), 0o700); err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(m.renv.SessionDir, 0o700); err != nil {
+		return nil, err
+	}
+	id := newID()
+	fname := filepath.Join(m.renv.SessionDir, id+".log")
+	hist, err := os.OpenFile(fname, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+
+	// Hold the manager lock across spawn and publication so CloseAll never leaves an orphan.
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closing {
+		hist.Close()
+		os.Remove(fname)
+		return nil, errors.New("console is stopping")
+	}
+	f, err := pty.StartWithSize(cmd, &pty.Winsize{Cols: 100, Rows: 30})
 	if err != nil {
 		hist.Close()
 		os.Remove(fname)
 		return nil, err
 	}
 	s := &Session{
-		id:    id,
-		renv:  m.renv,
-		cmd:   cmd,
-		pty:   f,
-		hist:  hist,
-		start: time.Now(),
+		id: id, user: user, workspace: workspace, mode: mode, done: make(chan struct{}),
+		cmd: cmd, pty: f, hist: hist, start: time.Now(),
 	}
-	go s.pump()
-	m.mu.Lock()
 	m.sessions[id] = s
-	m.mu.Unlock()
+	go s.pump()
 	return s, nil
 }
 
-func (m *SessionManager) get(id string) (*Session, bool) {
+func (m *SessionManager) get(user, id string) (*Session, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	s, ok := m.sessions[id]
-	return s, ok
+	if !ok || user == "" || s.user != user {
+		return nil, false
+	}
+	return s, true
 }
 
 // list 返回会话摘要列表（供前端启动时恢复会话）。
-func (m *SessionManager) list() []sessionInfo {
+func (m *SessionManager) list(user string) []sessionInfo {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	out := make([]sessionInfo, 0, len(m.sessions))
 	for id, s := range m.sessions {
+		if user == "" || user != s.user {
+			continue
+		}
 		info := sessionInfo{
-			ID:      id,
-			Created: s.start.Format(time.RFC3339),
+			ID: id, Workspace: s.workspace, Mode: s.mode,
+			Created: s.start.UTC().Format(time.RFC3339Nano),
 			Exited:  s.isExited(),
 		}
 		s.histMu.Lock()
@@ -500,12 +487,13 @@ func (m *SessionManager) list() []sessionInfo {
 		s.histMu.Unlock()
 		out = append(out, info)
 	}
+	sort.Slice(out, func(i, j int) bool { return m.sessions[out[i].ID].start.After(m.sessions[out[j].ID].start) })
 	return out
 }
 
 // history 读取会话历史文件内容（上限 maxHistoryBytes，取末尾部分）。
-func (m *SessionManager) history(id string) ([]byte, error) {
-	s, ok := m.get(id)
+func (m *SessionManager) history(user, id string) ([]byte, error) {
+	s, ok := m.get(user, id)
 	if !ok {
 		return nil, errors.New("session not found")
 	}
@@ -545,8 +533,8 @@ const clearKeepLineBytes = 8 * 1024
 //
 // 当前行为空（文件以换行结尾，光标停在空行行首）时没有可保留的内容，仍然整份清空：
 // 那种状态下屏幕上本来就只有一条空行。
-func (m *SessionManager) clearHistory(id string) error {
-	s, ok := m.get(id)
+func (m *SessionManager) clearHistory(user, id string) error {
+	s, ok := m.get(user, id)
 	if !ok {
 		return errors.New("session not found")
 	}
@@ -564,8 +552,7 @@ func (m *SessionManager) clearHistory(id string) error {
 //
 // 为什么不是一次 Truncate：Truncate 只能砍掉**文件末尾**，而这里要丢的是开头，
 // 只能「读出当前行 → 清空 → 写回」（与 trimHistoryLocked 同一个套路，只是它要保
-// 的是末尾）。代价是一次 ≤ clearKeepLineBytes 的读写；日志文件是 O_APPEND 打开的，
-// Truncate(0) 之后的 Write 必然落在位置 0。
+// 的是末尾）。代价是一次 ≤ clearKeepLineBytes 的读写。
 //
 // 只认 '\n' 作为换行：'\r' 是「回到行首重画」，行并没有结束，按它切会把半行输出
 // 留在文件开头、回放时错位。
@@ -603,27 +590,27 @@ func (s *Session) truncateToCurrentLineLocked() error {
 	if len(keep) == 0 {
 		return nil
 	}
-	_, err = s.hist.Write(keep)
+	_, err = s.hist.WriteAt(keep, 0)
 	return err
 }
 
 // closeByID 关闭指定会话并移除。
-func (m *SessionManager) closeByID(id string) error {
+func (m *SessionManager) closeByID(user, id string) error {
 	m.mu.Lock()
 	s, ok := m.sessions[id]
-	if ok {
-		delete(m.sessions, id)
-	}
-	m.mu.Unlock()
-	if !ok {
+	if !ok || user == "" || s.user != user {
+		m.mu.Unlock()
 		return errors.New("session not found")
 	}
+	delete(m.sessions, id)
+	m.mu.Unlock()
 	return s.close()
 }
 
 // CloseAll 终止所有会话（进程 + 文件），随后由 main 删除整个临时目录。
 func (m *SessionManager) CloseAll() {
 	m.mu.Lock()
+	m.closing = true
 	items := make([]*Session, 0, len(m.sessions))
 	for _, s := range m.sessions {
 		items = append(items, s)
@@ -635,17 +622,13 @@ func (m *SessionManager) CloseAll() {
 	}
 }
 
-// terminalHandler serves the terminal WebSocket on the admin unix socket.
-type terminalHandler struct {
-	mgr *SessionManager
-}
-
 // ServeHTTP hijacks the connection, upgrades to WebSocket, then either creates
 // a new session (id empty → 先发 \x1b]id;<id>\x07 控制帧) or attaches to an
 // existing one (回放历史 + \x1b]ready\x07 后进入实时流)。
 // 浏览器断开只解挂载；会话继续运行并写入历史临时文件，刷新后可重新挂载。
 // **单挂载点**：一个会话同时只有一个操作端，新挂载会顶掉旧连接（kickDetached）。
-func (t *terminalHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (m *AdminMux) handleTerminal(w http.ResponseWriter, r *http.Request) {
+	user := consoleUser(r)
 	hj, ok := w.(http.Hijacker)
 	if !ok {
 		http.Error(w, "hijack not supported", http.StatusInternalServerError)
@@ -656,52 +639,75 @@ func (t *terminalHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing Sec-WebSocket-Key", http.StatusBadRequest)
 		return
 	}
-	proto := r.Header.Get("Sec-WebSocket-Protocol")
+	rawKey, err := base64.StdEncoding.DecodeString(key)
+	if err != nil || len(rawKey) != 16 || r.Header.Get("Sec-WebSocket-Version") != "13" {
+		http.Error(w, "invalid websocket handshake", http.StatusBadRequest)
+		return
+	}
+	query := r.URL.Query()
+	id := query.Get("id")
+	var session *Session
+	var binary string
+	workspace := query.Get("workspace")
+	mode := query.Get("mode")
+	if mode == "" {
+		mode = "codex"
+	}
+	if id != "" {
+		var exists bool
+		session, exists = m.sessions.get(user, id)
+		if !exists {
+			http.NotFound(w, r)
+			return
+		}
+		workspace = session.workspace
+	} else if mode != "codex" && mode != "login" {
+		http.Error(w, "invalid session mode", http.StatusBadRequest)
+		return
+	}
+	workspace, err = m.workspace(r, workspace)
+	if err != nil || (session != nil && workspace != session.workspace) {
+		http.Error(w, "workspace unavailable", http.StatusForbidden)
+		return
+	}
+	if session == nil {
+		binary, err = m.codex.Binary()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusConflict)
+			return
+		}
+	}
 	conn, brw, err := hj.Hijack()
 	if err != nil {
 		return
 	}
-	protoHdr := ""
-	if proto != "" {
-		protoHdr = "\r\nSec-WebSocket-Protocol: " + proto
+	defer conn.Close()
+	if _, err := brw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + wsAccept(key) + "\r\n\r\n"); err != nil {
+		return
 	}
-	conn.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + wsAccept(key) + protoHdr + "\r\n\r\n"))
-	_ = brw.Flush()
-
-	id := r.URL.Query().Get("id")
-	if id == "" {
-		// 新建会话
-		s, cerr := t.mgr.create()
-		if cerr != nil {
-			conn.Write(wsFrame(opText, []byte("\r\n\x1b[31mcreate session failed: "+cerr.Error()+"\x1b[0m\r\n")))
-			conn.Write(wsFrame(opClose, nil))
-			conn.Close()
+	if err := brw.Flush(); err != nil {
+		return
+	}
+	if session == nil {
+		session, err = m.sessions.create(user, workspace, mode, binary)
+		if err != nil {
+			_ = writeFrame(conn, wsFrame(opText, []byte("\r\nCodex: "+err.Error()+"\r\n")))
+			_ = writeFrame(conn, wsCloseFrame(1011, "failed to start Codex"))
 			return
 		}
-		conn.Write(wsFrame(opText, []byte("\x1b]id;"+s.id+"\x07")))
-		if _, aerr := s.attach(conn); aerr != nil {
-			conn.Close()
+		if err := writeFrame(conn, wsFrame(opText, []byte("\x1b]id;"+session.id+"\x07"))); err != nil {
+			_ = m.sessions.closeByID(user, session.id)
 			return
-		}
-		id = s.id
-	} else {
-		s, ok := t.mgr.get(id)
-		if !ok {
-			conn.Write(wsFrame(opText, []byte("\r\n\x1b[31msession not found: "+id+"\x1b[0m\r\n")))
-			conn.Write(wsFrame(opClose, nil))
-			conn.Close()
-			return
-		}
-		// 单挂载点：挂载成功即成为操作端，旧连接被顶掉并收到「已被接管」通知。
-		prev, aerr := s.attach(conn)
-		if aerr != nil {
-			conn.Close()
-			return
-		}
-		if prev != nil {
-			kickDetached(prev)
 		}
 	}
+	prev, err := session.attach(conn)
+	if err != nil {
+		return
+	}
+	if prev != nil {
+		kickDetached(prev)
+	}
+	defer session.detach(conn)
 
 	// 读取客户端帧：普通数据写入 PTY；resize/ping 为 OSC 控制消息不进 PTY。
 	var msgBuf []byte
@@ -719,7 +725,7 @@ func (t *terminalHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// msgBuf 撑到内存耗尽（单帧上限在 wsReadFrame 里，这里管整条消息）。
 			if len(msgBuf)+len(payload) > maxMessageBytes {
 				logWarn("[terminal] message exceeds %d bytes, closing connection", maxMessageBytes)
-				goto done
+				return
 			}
 			msgBuf = append(msgBuf, payload...)
 			if !fin {
@@ -732,40 +738,29 @@ func (t *terminalHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				if len(parts) == 2 {
 					cols, err1 := strconv.Atoi(parts[0])
 					rows, err2 := strconv.Atoi(parts[1])
-					if err1 == nil && err2 == nil && cols > 0 && rows > 0 {
-						if sess, ok := t.mgr.get(id); ok {
-							// 只有操作端的尺寸生效（被顶掉的旧设备会随后触发一次重排）
-							if err := sess.resize(conn, uint16(cols), uint16(rows)); err != nil && !errors.Is(err, errNotOwner) {
-								logWarn("[terminal] resize failed: %v", err)
-							}
+					if err1 == nil && err2 == nil && cols > 0 && cols <= 65535 && rows > 0 && rows <= 65535 {
+						if err := session.resize(conn, uint16(cols), uint16(rows)); err != nil && !errors.Is(err, errNotOwner) {
+							logWarn("[terminal] resize failed: %v", err)
 						}
 					}
 				}
 			} else if strings.HasPrefix(s, "\x1b]ping") && strings.HasSuffix(s, "\x07") {
 				// 心跳：仅保持连接不被代理/NAT 空闲超时断开，不写入 PTY
 			} else {
-				if sess, ok := t.mgr.get(id); ok {
-					// 非操作端的残留输入在服务端丢弃（见 Session.writeInput 的说明）
-					if werr := sess.writeInput(conn, msgBuf); werr != nil && !errors.Is(werr, errNotOwner) {
-						logWarn("[terminal] write input failed: %v", werr)
-					}
+				if err := session.writeInput(conn, msgBuf); err != nil && !errors.Is(err, errNotOwner) {
+					logWarn("[terminal] write input failed: %v", err)
 				}
 			}
 		case opPing:
 			if werr := writeFrame(conn, wsFrame(opPong, payload)); werr != nil {
 				logWarn("[terminal] pong write failed: %v", werr)
-				goto done
+				return
 			}
 		case opClose:
-			goto done
+			return
 		}
 	}
-done:
-	// 只解除挂载，不杀会话（会话继续运行并写入历史文件）
-	if sess, ok := t.mgr.get(id); ok {
-		sess.detach(conn)
-	}
-	conn.Close()
+
 }
 
 // localeLang 决定 bash 会话的 LANG。中文输入依赖 UTF-8 多字节支持：

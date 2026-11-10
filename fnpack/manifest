@@ -1,0 +1,14 @@
+appname=CodexTerminal
+version=1.3.0
+display_name=Codex 工作台
+desc=在浏览器中与 Codex 对话、查看执行输出、审批命令与文件修改。支持选择 Codex 版本并在授权的 NAS 目录内工作。
+platform=x86
+source=thirdparty
+maintainer=fnOS-codex contributors
+maintainer_url=https://github.com/boolerule/fnOS-codex
+desktop_uidir=ui
+desktop_applaunchname=CodexTerminal.main
+install_dep_apps=nodejs_v24
+os_min_version=1.2.0401
+ctl_stop=true
+micro_app=true

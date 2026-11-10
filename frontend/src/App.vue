@@ -41,24 +41,23 @@ const toggleCollapse = () => {
 // 导航项：label 用 i18n 翻译。用 as const 固定 icon 为字面量联合类型，
 // 模板里 icons[item.icon] 才能被 vue-tsc 正确推导（否则 icon 退化为 string）。
 const allNav = [
-  { name: 'overview', labelKey: 'nav_overview', icon: 'overview' },
-  { name: 'settings', labelKey: 'nav_settings', icon: 'settings' },
-  { name: 'directory', labelKey: 'nav_directory', icon: 'folder' },
-  { name: 'plugins', labelKey: 'nav_plugins', icon: 'plugin' },
+  { name: 'workbench', labelKey: 'workbench', icon: 'chat' },
+  { name: 'overview', labelKey: 'version_management', icon: 'overview' },
   { name: 'terminal', labelKey: 'nav_terminal', icon: 'terminal' },
-  { name: 'logs', labelKey: 'nav_logs', icon: 'logs' }
+  { name: 'logs', labelKey: 'nav_logs', icon: 'logs' },
+  { name: 'github', labelKey: 'nav_github', icon: 'repo' },
 ] as const
+const repositoryLink = { href: 'https://github.com/boolerule/fnOS-codex', target: '_blank', rel: 'noopener noreferrer' }
 
 // 终端功能可在编译期整体剔除（TERMINAL=0，见 vite.config.ts）：入口一并消失，
 // 产物里也没有终端页/xterm。其余页面不在这次构建里时照旧。
 const nav = allNav.filter((item) => item.name !== 'terminal' || __TERMINAL_ENABLED__)
 
-// 当前子页面：优先 URL 查询参数，否则固定为概览页。
-// 「打开时的默认页面」设置已移除：控制台打开就是概览，页面切换只走 ?view=。
+// 用户可直达管理页或终端，桌面入口默认打开工作台。
 const current = computed(() => {
   const q = typeof route.query.view === 'string' ? route.query.view : ''
-  if (q && nav.some((n) => n.name === q)) return q
-  return 'overview'
+  if (q && nav.some((n) => n.name !== 'github' && n.name === q)) return q
+  return 'workbench'
 })
 
 // 控制台 HTML 标题随子页面切换动态显示（只显示子页面标题，如“概览/设置”，无前缀）
@@ -66,7 +65,7 @@ watch(
   [current, () => locale.value],
   () => {
     const item = nav.find((n) => n.name === current.value)
-    document.title = item ? t(item.labelKey) : ''
+    document.title = item ? t(item.labelKey) + ' · Codex' : 'Codex'
   },
   { immediate: true }
 )
@@ -77,7 +76,7 @@ function navigate(name: string) {
 }
 
 let appliedDefault = false
-// URL 未指定子页面时补上 ?view=overview（让地址栏始终反映当前子页面）。
+// URL 未指定子页面时补上工作台地址。
 // 必须等 `router.isReady()` 再判断：初始导航（含子页面懒加载 chunk）解析完成之前
 // `route.query` 还是 START_LOCATION 的空 Query —— 那时判断会把 `?view=logs`
 // 这类直达链接（含 /logs、/terminal 旧路径的 302 目标）覆盖成概览。
@@ -86,7 +85,7 @@ function applyDefaultView() {
   if (appliedDefault) return
   appliedDefault = true
   if (!route.query.view) {
-    router.replace({ path: '/', query: { view: 'overview' } })
+    router.replace({ path: '/', query: { ...route.query, view: 'workbench' } })
   }
 }
 
@@ -114,7 +113,7 @@ const languageTitle = computed(() => t(locale.value === 'zh' ? 'lang_zh' : 'lang
 
 // 阻止浏览器后退/滑动返回切换子页面
 onMounted(() => {
-  // 打开时一律先到概览页；带 ?view= 的直达链接由 current/applyDefaultView 保留。
+  // 等待初始导航完成，以保留带 ?view= 的直达链接。
   router.isReady().then(applyDefaultView, () => {})
 
   // 用 replace 切换子页面，URL 始终保持在 / 路径下；兜底处理浏览器后退/手势，
@@ -165,18 +164,18 @@ onMounted(() => {
           :class="collapsed ? 'justify-center px-1' : 'justify-start px-1.5'"
           :title="collapsed ? t('sidebar_expand') : t('sidebar_collapse')"
         >
-          <!-- 「展开/折叠」按钮的图标：鲸鱼（icons.whale，自带配色，父级的 text-* 不影响它）。
+          <!-- 「展开/折叠」按钮的图标：鲸鱼（icons.terminal，自带配色，父级的 text-* 不影响它）。
                源 SVG 带 800px 固定尺寸，已去掉并改为由这里的 w-6 h-6（24px）控制 ——
                在 32px 的圆角方框里留出呼吸感，与导航图标（20px）比例协调。 -->
           <span
             class="w-8 h-8 rounded-xl bg-brand/10 flex items-center justify-center shrink-0 transition-transform duration-500 group-hover:scale-110"
           >
-            <span class="w-6 h-6 inline-block" v-html="icons.whale"></span>
+            <span class="w-6 h-6 inline-block" v-html="icons.terminal"></span>
           </span>
           <span
             class="font-display text-sm font-semibold whitespace-nowrap overflow-hidden text-ink dark:text-white transition-all duration-300 ease-in-out"
             :class="collapsed ? 'opacity-0 max-w-0 ml-0' : 'opacity-100 max-w-[8rem] ml-2.5'"
-          >Harness</span>
+          >Codex</span>
         </button>
         <button
           v-if="!collapsed"
@@ -189,7 +188,8 @@ onMounted(() => {
 
       <!-- 导航链接：展开时左对齐 + 悬停右移，折叠时图标居中 + 悬停放大 -->
       <nav class="flex-1 min-h-0 overflow-y-auto flex flex-col gap-1 p-2">
-        <button v-for="item in nav" :key="item.name" @click="navigate(item.name)"
+        <component v-for="item in nav" :key="item.name" :is="item.name === 'github' ? 'a' : 'button'"
+          v-bind="item.name === 'github' ? repositoryLink : {}" @click="item.name !== 'github' && navigate(item.name)"
           class="w-full flex items-center rounded-xl text-sm font-medium transition-all duration-300 active:scale-95"
           :class="[
             current === item.name
@@ -202,7 +202,7 @@ onMounted(() => {
             class="whitespace-nowrap overflow-hidden transition-all duration-300 ease-in-out"
             :class="collapsed ? 'opacity-0 max-w-0 ml-0' : 'opacity-100 max-w-[8rem] ml-3'"
           >{{ t(item.labelKey) }}</span>
-        </button>
+        </component>
       </nav>
 
       <!-- 底部：主题 / 语言（展开时左右并排，折叠时上下堆叠；文字同样用 max-w 过渡收起）。
@@ -247,14 +247,17 @@ onMounted(() => {
          一旦拿视口量当偏移量，底栏就会上下乱窜。键盘弹起时整条底栏由 style.css 的
          html[data-kb] 规则隐去，终端页改为贴合键盘（功能键栏落在键盘顶边）。 -->
     <nav
-      class="mobile-bottom-nav flex md:hidden fixed bottom-0 left-0 right-0 bg-surface dark:bg-[#111115] border-t border-line dark:border-[#2A2A32] items-center justify-center z-10 gap-2 sm:gap-[18px]"
+      class="mobile-bottom-nav flex md:hidden fixed bottom-0 left-0 right-0 bg-surface dark:bg-[#111115] border-t border-line dark:border-[#2A2A32] items-center justify-around sm:justify-center z-10 sm:gap-3"
       style="height: var(--bottom-nav-h); padding-left: calc(env(safe-area-inset-left) + 0.5rem); padding-right: calc(env(safe-area-inset-right) + 0.5rem); padding-bottom: env(safe-area-inset-bottom);">
-      <button v-for="item in nav" :key="item.name" @click="navigate(item.name)"
+      <component v-for="item in nav" :key="item.name" :is="item.name === 'github' ? 'a' : 'button'"
+        v-bind="item.name === 'github' ? repositoryLink : {}" @click="item.name !== 'github' && navigate(item.name)"
         class="flex flex-col items-center justify-center w-12 h-12 rounded-lg text-xl transition-all duration-200 active:scale-90 cursor-pointer"
         :class="current === item.name ? 'text-brand scale-105' : 'text-ink-soft dark:text-[#A6A6AD] hover:bg-black/5 dark:hover:bg-white/5'"
         :title="t(item.labelKey)" :aria-label="t(item.labelKey)">
         <span class="w-6 h-6 inline-block" v-html="icons[item.icon]"></span>
-      </button>
+      </component>
+      <button class="h-12 px-3 text-sm" :title="themeTitle" @click="cycleTheme"><span class="inline-block w-5 h-5" v-html="themeIcon"></span></button>
+      <button class="h-12 px-3 text-sm" :title="languageTitle" @click="cycleLanguage">{{ locale === 'zh' ? 'EN' : '中' }}</button>
     </nav>
 
     <!-- ===== 主内容区域（使用 KeepAlive 缓存终端组件） =====
@@ -276,9 +279,7 @@ onMounted(() => {
       class="pl-0 h-[calc(100dvh_-_var(--bottom-nav-h))] overflow-y-auto pb-[var(--kb-inset,0px)] md:h-auto md:overflow-visible md:pb-0 transition-all duration-300"
       :class="collapsed ? 'md:pl-[5.5rem]' : 'md:pl-[16.5rem]'"
     >
-      <KeepAlive>
-        <RouterView />
-      </KeepAlive>
+      <RouterView />
     </main>
   </div>
 </template>

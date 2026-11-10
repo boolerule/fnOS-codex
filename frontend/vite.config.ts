@@ -8,7 +8,7 @@ import { gzipSync } from 'node:zlib'
 // The frontend is embedded into the Go binary at build time and served over the
 // admin unix socket under a baseurl prefix fronted by nginx. The baseurl is NOT
 // known at build time and must NOT be baked into the binary — it is resolved at
-// runtime from the environment (HARNESS_ADMIN_BASEURL). So we build with a
+// runtime from the environment (the admin mount). So we build with a
 // RELATIVE base (./assets/...), and the backend prepends the runtime baseurl
 // to asset URLs when it serves index.html.
 // 终端功能可在编译期整体剔除：构建时置 TERMINAL=0（make / build.sh 会同时给 Go 传
@@ -24,7 +24,7 @@ const terminalEnabled = process.env.VITE_TERMINAL !== '0'
 function precompressAssets(): Plugin {
   const assetsDir = fileURLToPath(new URL('./dist/assets', import.meta.url))
   return {
-    name: 'harness-precompress-assets',
+    name: 'codex-precompress-assets',
     apply: 'build',
     closeBundle() {
       let files: string[]
@@ -67,7 +67,7 @@ export default defineConfig({
     }
   },
   base: './',
-  // 将 src/public 目录作为 Vite 的静态资源根目录，使 callback.html 等文件被复制到 dist
+  // 将 src/public 目录作为 Vite 的静态资源根目录
   publicDir: 'src/public',
   build: {
     outDir: 'dist',

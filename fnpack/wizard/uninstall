@@ -1,0 +1,21 @@
+[
+  {
+    "stepTitle": "卸载 Codex 工作台",
+    "items": [
+      {
+        "type": "radio",
+        "field": "wizard_codex_cleanup",
+        "label": "是否同时清理 Codex CLI？",
+        "initValue": "keep",
+        "options": [
+          { "label": "仅卸载工作台，保留系统安装的 Codex", "value": "keep" },
+          { "label": "同时卸载工作台托管的 CLI 和可移除的系统 npm 全局 Codex", "value": "remove" }
+        ]
+      },
+      {
+        "type": "tips",
+        "helpText": "同步清理会影响共用这些 CLI 的其他程序。工作台使用普通应用账户，遇到受系统保护或由其他安装器管理的版本，会提示剩余路径及处理方式。CLI 清理步骤仅处理软件包；项目、账号和对话数据由飞牛原有的数据保留选项管理。"
+      }
+    ]
+  }
+]

@@ -16,14 +16,8 @@ describe('i18n', () => {
     expect(t('nav_overview')).toBe('Overview')
   })
 
-  it('localizes mirror slugs inside backend-provided params', () => {
-    const ref = {
-      code: 'msg_install_from_mirror',
-      params: { mirror: 'aliyun', pkg: 'dsh', version: '0.2.2' }
-    }
-    expect(uiText('', ref)).toBe('正在从 阿里云 下载 dsh@0.2.2')
-    setLocale('en')
-    expect(uiText('', ref)).toBe('Downloading dsh@0.2.2 from Aliyun')
+  it('keeps workspace paths literal in a translated confirmation', () => {
+    expect(useI18n().t('end_session_hint', { path: '/data/$&' })).toContain('/data/$&')
   })
 
   it('falls back to the backend original text when code is unknown', () => {
@@ -32,7 +26,7 @@ describe('i18n', () => {
   })
 
   it('renders ApiError-like objects through uiErrText', () => {
-    expect(uiErrText({ code: 'err_need_version', params: {} }, 'fallback')).toBe('缺少 version')
+    expect(uiErrText({ code: 'not_installed', params: {} }, 'fallback')).toBe('尚未安装')
     expect(uiErrText(new Error('boom'), 'fallback')).toBe('boom')
   })
 })

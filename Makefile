@@ -1,96 +1,24 @@
-# Makefile: builds the Vue frontend, embeds the static assets into the Go
-# backend binary, then compiles the single self-contained harness backend.
-#
-#   make              # dev (default, non-stripped)
-#   make release V=1.0.1   # release build (strip + -ldflags), version override
-#   TERMINAL=0 make   # build without the terminal feature (same as: make noterminal)
-#   make clean        # remove build artifacts
-#
-# The backend serves the embedded assets over its unix socket under the
-# configured baseurl (e.g. /app/Harness) fronted by nginx.
-#
-# Go cache/module variables default to project-local dirs (same as build.sh);
-# pre-set environment values (GOCACHE/GOPATH) still take precedence.
-
-ROOT      := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
-BACKEND   := $(ROOT)/backend
-FRONTEND  := $(ROOT)/frontend
-EMBED     := $(BACKEND)/embed
-OUT       := $(BACKEND)/harness
-
-# 控制台版本号：默认 1.0.0，可经 V 覆盖（如 make release V=1.0.1）。
-version   ?= 1.0.0
-V         ?= $(version)
-
-# 终端功能开关：TERMINAL=0（或 make noterminal）时整体剔除 —— Go 传 -tags noterminal，
-# 前端传 VITE_TERMINAL=0。产物里没有终端页、PTY 会话、快捷指令接口，xterm 也不进前端包。
-TERMINAL  ?= 1
-ifeq ($(TERMINAL),0)
-GO_TAGS       := noterminal
-VITE_TERMINAL := 0
-else
-GO_TAGS       :=
-VITE_TERMINAL := 1
-endif
-export VITE_TERMINAL
-
-# 与 build.sh 一致：默认把 Go 缓存放到项目本地目录；若环境中已设置
-# GOCACHE/GOPATH 则沿用环境值（?= 只在未定义时赋值）。
-GOCACHE   ?= $(ROOT)/.gocache
-GOPATH    ?= $(ROOT)/.gopath
-export GOCACHE GOPATH
-export GOFLAGS="-buildvcs=false"
-export PATH := /var/apps/nodejs_v24/target/bin:$(PATH)
-
-.PHONY: all dev release noterminal test clean
+.PHONY: all dev release noterminal test clean fpk
+V ?= 1.3.0
+TERMINAL ?= 1
+export TERMINAL
 
 all: dev
+fpk:
+	TERMINAL=1 bash ./build.sh cross "$(V)"
+	VERSION="$(V)" sh ./package-fpk.sh
 
-# Frontend build artifacts / node_modules flagged in ROOT/.gitignore.
-.NOTPARALLEL:
+dev release:
+	bash ./build.sh $@ "$(V)"
 
-dev: ## Dev build (default, non-stripped)
-	$(MAKE) build LDFLAGS="-X main.harnessVersion=$(V)"
+noterminal:
+	TERMINAL=0 bash ./build.sh dev "$(V)"
 
-release: ## Release build (strip + external linking)
-	$(MAKE) build LDFLAGS="-s -w -linkmode=external -X main.harnessVersion=$(V)"
-
-noterminal: ## Build without the terminal feature (no terminal page / PTY / xterm)
-	$(MAKE) build TERMINAL=0 LDFLAGS="-X main.harnessVersion=$(V)"
-
-# 后端单元测试。main.go 用 //go:embed all:embed 打包前端产物，而该目录在构建后被
-# 清空，因此测试前先补一个占位文件（否则包无法编译）。占位内容不影响测试。
-test: ## Run backend unit tests
-	mkdir -p "$(EMBED)"
-	@test -e "$(EMBED)/index.html" || echo "placeholder for //go:embed (see Makefile test target)" > "$(EMBED)/index.html"
-	cd "$(BACKEND)" && go test -tags "$(GO_TAGS)" ./...
-
-# Common build steps. LDFLAGS is passed in from dev/release.
-build:
-	@echo "==> Building frontend..."
-	cd "$(FRONTEND)" && npm install --no-audit --no-fund && VITE_TERMINAL=$(VITE_TERMINAL) npm run build
-	@if [ "$(TERMINAL)" = "0" ]; then \
-		echo "==> Verifying no terminal assets in dist..."; \
-		if grep -rIl --include='*.js' --include='*.css' --include='*.html' 'xterm' "$(FRONTEND)/dist"; then \
-			echo "ERROR: xterm leaked into the frontend bundle (TERMINAL=0 build)"; \
-			exit 1; \
-		fi; \
-	fi
-	@echo "==> Copying frontend dist into embed dir..."
-	rm -rf "$(EMBED)"
-	mkdir -p "$(EMBED)"
-	cp -r "$(FRONTEND)"/dist/* "$(EMBED)"/
-	@echo "==> Building Go binary..."
-	# Ensure local Go cache dirs exist (build.sh 同样如此)。
-	mkdir -p "$(GOCACHE)" "$(GOPATH)"
-	# Clean the Go build cache so code and embedded-asset changes always compile in.
-	go clean -cache
-	cd "$(BACKEND)" && go build -trimpath -tags "$(GO_TAGS)" -ldflags "$(LDFLAGS)" -o "$(OUT)" .
-	@echo "==> Cleaning embed dir..."
-	rm -rf "$(EMBED)"
-	@echo "==> Done: $(OUT)"
-	ls -lh "$(OUT)"
+test:
+	mkdir -p backend/embed
+	test -e backend/embed/index.html || echo '<html></html>' > backend/embed/index.html
+	cd backend && go test $(if $(filter 0,$(TERMINAL)),-tags noterminal) ./...
 
 clean:
-	rm -rf "$(EMBED)"
-	rm -f "$(BACKEND)/harness"
+	rm -rf backend/embed
+	rm -f backend/codex-console

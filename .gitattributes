@@ -1,0 +1,7 @@
+*.sh text eol=lf
+fnpack/manifest text eol=lf
+fnpack/cmd/* text eol=lf
+fnpack/config/* text eol=lf
+fnpack/wizard/* text eol=lf
+fnpack/wizard/* text eol=lf
+fnpack/app/ui/config text eol=lf

@@ -69,6 +69,8 @@ const html = computed(() => renderMarkdown(props.source))
 .markdown-text :deep(li) {
   margin: 0.2em 0;
 }
+.markdown-text :deep(ul) { list-style: disc; }
+.markdown-text :deep(ol) { list-style: decimal; }
 .markdown-text :deep(li > input[type='checkbox']) {
   accent-color: #6366f1;
   margin-right: 0.3em;

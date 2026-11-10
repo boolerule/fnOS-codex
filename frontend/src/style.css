@@ -430,35 +430,6 @@ html, body {
     opacity: 0.5;
     cursor: not-allowed;
   }
-  /* 数字输入框：隐藏浏览器原生步进器（设置页的 dsh 端口 / 反代端口 / 内存上限 /
-     登录有效期）。只去掉上下箭头控件，保留 type="number" 的语义 —— 移动端数字键盘、
-     min/max 校验与键盘 ↑/↓ 调整照常生效，避免鼠标误点箭头改掉端口这类关键值。
-     Firefox 用 appearance: textfield 去除步进器，WebKit/Blink 走 ::-webkit-*-spin-button。 */
-  .g-input[type='number'] {
-    -moz-appearance: textfield;
-    appearance: textfield;
-  }
-  .g-input[type='number']::-webkit-outer-spin-button,
-  .g-input[type='number']::-webkit-inner-spin-button {
-    -webkit-appearance: none;
-    appearance: none;
-    margin: 0;
-  }
-
-  /* 标签 chip：胶囊形状 */
-  .g-chip {
-    @apply inline-flex items-center gap-1 rounded-full bg-black/5 dark:bg-white/10
-      text-ink-soft dark:text-[#B0B0B8] px-3 py-1 text-xs font-medium whitespace-nowrap;
-  }
-  .g-chip-active {
-    @apply bg-brand text-white;
-  }
-
-  /* 状态 chip：胶囊 + 语义色 */
-  .g-status {
-    @apply inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium;
-  }
-
   /* ===== 弹窗统一结构（配合 components/DialogCloseButton.vue） =====
      弹窗标题用 .g-dialog-title（统一字号/字重/前景色，并给右上角 X 留出位置），
      关闭按钮统一用 <DialogCloseButton>（内部就是 .g-dialog-close，绝对定位到右上角），
@@ -516,40 +487,6 @@ html, body {
     touch-action: none;
   }
 }
-/* ===== 日志区域：底色与行色都跟随主题 =====
-   浅色主题「浅底深字」、暗色主题「深底浅字」；行级色（WARN / ERROR / dsh 子进程输出）
-   同样各一套 —— 暗色主题那套亮黄/亮红放到浅底上会发白、几乎看不清，所以浅色主题用深一档
-   的语义色。这几条刻意放在 @layer 之外：它们要盖过 Tailwind 工具类写死的前景色，
-   且 .dark 变体是自己写的，不依赖 utilities 层的生成顺序。
-   类名由 LogView 的行着色逻辑给出（见 LEVEL_CLASS / DSH_CLASS）。 */
-.log-viewer {
-  background-color: #f7f8fa;
-  color: #33373d;
-}
-.dark .log-viewer {
-  background-color: #0f1115;
-  color: #d6dce4;
-}
-.log-line-warn {
-  /* 浅色语义色统一取 *-ink（见 @theme），别在这里再写一份十六进制 */
-  color: var(--color-warning-ink);
-}
-.dark .log-line-warn {
-  color: #fbbf24;
-}
-.log-line-error {
-  color: #dc2626;
-}
-.dark .log-line-error {
-  color: #f87171;
-}
-.log-line-dsh {
-  color: #a16207;
-}
-.dark .log-line-dsh {
-  color: #facc15;
-}
-
 /* ===== 全局文本选择策略 =====
    控制台是「应用式」UI：默认全局禁止文本选择 —— 拖动/长按不会误选中一片文字（触屏上还会
    弹出系统选择菜单，与终端的长按粘贴、键条的长按连发互相干扰）。只有明确需要复制的地方

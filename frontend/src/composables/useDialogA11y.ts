@@ -1,14 +1,14 @@
 // useDialogA11y —— 弹窗的键盘/读屏基础能力（角色、焦点、Escape、背景 inert）。
 //
 // 控制台的弹窗都是「Teleport 到 body 的遮罩 + 面板」，此前只有鼠标能用：实测打开
-// dsh 版本弹窗后焦点仍停在触发按钮上、没有 role/aria-modal、按 Escape 不关闭，
+// 确认弹窗后焦点仍停在触发按钮上、没有 role/aria-modal、按 Escape 不关闭，
 // Tab 还能跑到弹窗背后。这里把共性抽出来，各弹窗只需：
 //   1. 在面板上挂 `ref="panel"`、`tabindex="-1"`、`role="dialog"`、`aria-modal="true"`、
 //      `:aria-label="..."`；
 //   2. 调一次 useDialogA11y(() => 可见性, panel, { onClose })。
 //
 // 三个实现要点：
-//   - **模块级 stack**：弹窗会叠加（版本列表 → 切换确认），Escape 只能由最上层处理；
+//   - **模块级 stack**：弹窗会叠加，Escape 只能由最上层处理；
 //   - **#app inert**：面板 Teleport 在 body，把 #app 设成 inert 就能一次性挡住背景的
 //     焦点/读屏，不需要手写「把所有兄弟节点 tabindex=-1」；用引用计数支持叠加；
 //   - **焦点归还**：打开前记下 activeElement，关闭时还原（组件被卸载也会走 onScopeDispose）。

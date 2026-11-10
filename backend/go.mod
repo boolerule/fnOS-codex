@@ -1,4 +1,4 @@
-module harness-app/backend
+module fnos-codex/backend
 
 require github.com/creack/pty v1.1.24
 

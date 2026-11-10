@@ -1,0 +1,78 @@
+#!/bin/sh
+# The backend creates app.sock and writes its own PID after binding the socket.
+set -u
+umask 077
+
+target=${TRIM_APPDEST:?}
+data=${TRIM_PKGVAR:?}
+binary="$target/bin/codex-console"
+pidfile="$data/codex-console.pid"
+socket="$target/app.sock"
+log="$data/console.log"
+
+fail() {
+    printf '%s\n' "$1" >&2
+    if [ -n "${TRIM_TEMP_LOGFILE:-}" ]; then
+        printf '%s\n' "$1" > "$TRIM_TEMP_LOGFILE"
+    fi
+    exit 1
+}
+
+is_console() {
+    case "$1" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$1" -gt 1 ] && [ "/proc/$1/exe" -ef "$binary" ] || return 1
+    # Distinguish two installations launched with the same executable.
+    tr '\000' '\n' < "/proc/$1/environ" 2>/dev/null |
+        grep -Fqx -e "CODEX_CONSOLE_DATA=$data"
+}
+
+running() {
+    [ -r "$pidfile" ] || return 1
+    pid=$(cat "$pidfile") && is_console "$pid"
+}
+
+case "${1:-}" in
+    start)
+        if running; then
+            [ -S "$socket" ] || fail "控制台进程正在运行，但网关套接字不可用。请停止后重新启动。"
+            exit 0
+        fi
+        [ -x "$binary" ] || fail "控制台程序缺失或无法执行，请重新安装对应架构的安装包。"
+        export CODEX_CONSOLE_DATA="$data"
+        export CODEX_CONSOLE_SOCKET="$socket"
+        export CODEX_CONSOLE_BASE="/app/${TRIM_APPNAME:?}"
+        export HOME="${TRIM_PKGHOME:-$data/home}"
+        export PATH="/var/apps/nodejs_v24/target/bin:${PATH:-/usr/bin:/bin}"
+        unset CODEX_CONSOLE_LISTEN CODEX_CONSOLE_PASSWORD
+        mkdir -p "$data" "$HOME" || fail "无法创建控制台数据目录或应用主目录。"
+        "$binary" </dev/null >>"$log" 2>&1 &
+        child=$!
+        count=0
+        while [ "$count" -lt 15 ]; do
+            if running && [ -S "$socket" ]; then exit 0; fi
+            kill -0 "$child" 2>/dev/null || break
+            count=$((count + 1))
+            sleep 1
+        done
+        if is_console "$child"; then kill -TERM "$child" 2>/dev/null; fi
+        fail "控制台启动失败，请查看 $log。"
+        ;;
+    stop)
+        running || exit 0
+        if ! kill -TERM "$pid" 2>/dev/null && is_console "$pid"; then
+            fail "无法向控制台进程发送停止信号。"
+        fi
+        count=0
+        while is_console "$pid"; do
+            [ "$count" -lt 30 ] || fail "控制台尚未退出，请查看 $log。"
+            count=$((count + 1))
+            sleep 1
+        done
+        ;;
+    status)
+        running && [ -S "$socket" ] && exit 0
+        exit 3
+        ;;
+    *) fail "未知的控制台操作。" ;;
+esac
+exit 0

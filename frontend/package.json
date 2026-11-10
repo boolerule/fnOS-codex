@@ -1,7 +1,7 @@
 {
-  "name": "harness-admin-frontend",
+  "name": "fnos-codex-console",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.3.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -18,7 +18,8 @@
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/addon-unicode11": "^0.9.0",
     "@xterm/xterm": "^6.0.0",
-    "marked": "^18.1.2",
+    "dompurify": "3.4.17",
+    "marked": "18.1.2",
     "pinia": "^4.1.0",
     "vue": "^3.5.44",
     "vue-router": "^5.4.0"

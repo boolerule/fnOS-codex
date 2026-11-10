@@ -25,7 +25,6 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 )
 
@@ -33,12 +32,12 @@ import (
 func newHistorySession(t *testing.T, id string) (*Session, string) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), id+".log")
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o600)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { f.Close() })
-	return &Session{id: id, hist: f}, path
+	return &Session{id: id, user: "alice", hist: f}, path
 }
 
 // appendHistory 在 histMu 内追加一段输出（与 pump 的调用方式一致）。
@@ -93,7 +92,7 @@ func TestHistoryReadAfterTrim(t *testing.T) {
 	tail := []byte("recent-output\n")
 	appendHistory(s, tail)
 
-	got, err := mgr.history("read")
+	got, err := mgr.history("alice", "read")
 	if err != nil {
 		t.Fatalf("history: %v", err)
 	}
@@ -113,12 +112,12 @@ func TestHistoryAppendAfterClear(t *testing.T) {
 	mgr := &SessionManager{renv: &RuntimeEnv{}, sessions: map[string]*Session{"clear": s}}
 
 	appendHistory(s, bytes.Repeat([]byte("x"), 256*1024))
-	if err := mgr.clearHistory("clear"); err != nil {
+	if err := mgr.clearHistory("alice", "clear"); err != nil {
 		t.Fatalf("clearHistory: %v", err)
 	}
 	appendHistory(s, []byte("after-clear\n"))
 
-	got, err := mgr.history("clear")
+	got, err := mgr.history("alice", "clear")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,10 +142,10 @@ func TestClearKeepsCurrentPromptLine(t *testing.T) {
 	prompt := []byte("\x1b[?2004l\r\x1b[?2004hHarness@fnOS:~$ ")
 	appendHistory(s, prompt)
 
-	if err := mgr.clearHistory("keep"); err != nil {
+	if err := mgr.clearHistory("alice", "keep"); err != nil {
 		t.Fatalf("clearHistory: %v", err)
 	}
-	got, err := mgr.history("keep")
+	got, err := mgr.history("alice", "keep")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -156,7 +155,7 @@ func TestClearKeepsCurrentPromptLine(t *testing.T) {
 
 	// 清屏后继续输出：新内容接在保留的当前行后面（回放顺序与真实屏幕一致）
 	appendHistory(s, []byte("ls\r\nfile1\r\n"))
-	got, err = mgr.history("keep")
+	got, err = mgr.history("alice", "keep")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -171,10 +170,10 @@ func TestClearDropsEmptyCurrentLine(t *testing.T) {
 	mgr := &SessionManager{renv: &RuntimeEnv{}, sessions: map[string]*Session{"emptyline": s}}
 
 	appendHistory(s, []byte("first\r\nsecond\r\n"))
-	if err := mgr.clearHistory("emptyline"); err != nil {
+	if err := mgr.clearHistory("alice", "emptyline"); err != nil {
 		t.Fatalf("clearHistory: %v", err)
 	}
-	got, err := mgr.history("emptyline")
+	got, err := mgr.history("alice", "emptyline")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,10 +190,10 @@ func TestClearDropsOverlongUnsplittableTail(t *testing.T) {
 
 	appendHistory(s, []byte("done\r\n"))
 	appendHistory(s, bytes.Repeat([]byte("y"), clearKeepLineBytes*2))
-	if err := mgr.clearHistory("longtail"); err != nil {
+	if err := mgr.clearHistory("alice", "longtail"); err != nil {
 		t.Fatalf("clearHistory: %v", err)
 	}
-	got, err := mgr.history("longtail")
+	got, err := mgr.history("alice", "longtail")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -210,10 +209,10 @@ func TestClearKeepsSingleLineHistory(t *testing.T) {
 
 	line := []byte("Harness@fnOS:~$ echo hi")
 	appendHistory(s, line)
-	if err := mgr.clearHistory("oneline"); err != nil {
+	if err := mgr.clearHistory("alice", "oneline"); err != nil {
 		t.Fatalf("clearHistory: %v", err)
 	}
-	got, err := mgr.history("oneline")
+	got, err := mgr.history("alice", "oneline")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -233,7 +232,7 @@ func TestReplayAfterClearStillShowsPrompt(t *testing.T) {
 	prompt := []byte("\x1b[?2004l\r\x1b[?2004hHarness@fnOS:~$ ")
 	appendHistory(s, prompt)
 
-	if err := mgr.clearHistory("replay"); err != nil {
+	if err := mgr.clearHistory("alice", "replay"); err != nil {
 		t.Fatalf("clearHistory: %v", err)
 	}
 
@@ -250,37 +249,5 @@ func TestReplayAfterClearStillShowsPrompt(t *testing.T) {
 	}
 	if !bytes.HasSuffix(replay, []byte("\x1b]ready\x07")) {
 		t.Fatal("回放结束后必须紧跟 ready 帧（前端据此结束历史回放）")
-	}
-}
-
-// 终端会话镜像目录的默认解析：空 RuntimeEnv（部分单测直接构造字面量）必须落回统一
-// 数据目录下的 terminal-sessions，不能各自拼路径。
-//
-// 这条断言原本在 data_dir_test.go：无终端构建（-tags noterminal）里 SessionManager
-// 只是空壳，该文件要能在两种构建下编译，因此把终端专属的断言挪到这里。
-func TestSessionDirFallsBackToDataDir(t *testing.T) {
-	dataDir := t.TempDir()
-	t.Setenv("HARNESS_DATA_DIR", dataDir)
-	if p := (&SessionManager{}).sessionDir(); p != filepath.Join(dataDir, "terminal-sessions") {
-		t.Errorf("sessionDir(空 renv) = %q", p)
-	}
-}
-
-func TestTerminalEnvPrependsStableDshShimDir(t *testing.T) {
-	renv := &RuntimeEnv{DataDir: t.TempDir(), Path: "/usr/bin:/bin"}
-	env := terminalEnv(renv, "")
-
-	pathVal := ""
-	for _, e := range env {
-		if strings.HasPrefix(e, "PATH=") {
-			pathVal = strings.TrimPrefix(e, "PATH=")
-		}
-	}
-	want := serverShimDirFor(renv)
-	if !strings.HasPrefix(pathVal, want+":") {
-		t.Fatalf("PATH = %q, want prefix %q", pathVal, want+":")
-	}
-	if !strings.HasSuffix(pathVal, ":/usr/bin:/bin") {
-		t.Fatalf("PATH = %q, want original platform PATH preserved", pathVal)
 	}
 }

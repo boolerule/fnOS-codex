@@ -1,481 +1,294 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { storeToRefs } from 'pinia'
-import { useSettingsStore } from '@/stores/settings'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { useRouter } from 'vue-router'
+import { api, type CodexStatus, type LocalCodexVersions, type SessionInfo, type TerminalMode, type Workspace } from '@/serverapi'
+import { useI18n, uiErrText } from '@/composables/useI18n'
+import { requestLaunch } from '@/composables/useTerminalLaunch'
 import { useToastStore } from '@/stores/toast'
-import { api, sseUrl, type Visitor, type DshStatus } from '@/serverapi'
-import { uiErrText, uiText, useI18n } from '@/composables/useI18n'
-import { useEventStream } from '@/composables/useEventStream'
-import { useBodyScrollLock } from '@/composables/useBodyScrollLock'
-import { useWideLayout } from '@/composables/useMobileLayout'
-import { useAccountCardVisible } from '@/composables/useAccountCardVisible'
+import { fnosAppNeedsWebDirectoryAuth } from '@/utils/fnosApp'
+import { trimAppReady } from '@/utils/trimApp'
+import { buildFnosAuthURL, fnosAuthReturnURL, readFnosAuthReturn, rememberFnosAuthState, stripFnosAuthReturn, takeFnosAuthState } from '@/utils/fnosAuth'
+import { randomId } from '@/utils/randomId'
 import ConfirmDialog from '@/components/ConfirmDialog.vue'
-import UpdateSection from '@/components/UpdateSection.vue'
-import PageHeader from '@/components/PageHeader.vue'
-import AccountCard from '@/components/account/AccountCard.vue'
-import VisitorsCard from '@/components/overview/VisitorsCard.vue'
-import { isFnosApp } from '@/utils/fnosApp'
-import { icons } from '@/utils/icons'
+import CodexVersionDialog from '@/components/CodexVersionDialog.vue'
 
-defineOptions({ name: 'OverviewView' })
-
-const store = useSettingsStore()
-const { status, loading, runtime } = storeToRefs(store)
+const router = useRouter()
+const { t, locale } = useI18n()
 const toast = useToastStore()
-const { t } = useI18n()
+const terminalEnabled = __TERMINAL_ENABLED__
+const status = ref<CodexStatus | null>(null)
+const localVersions = ref<LocalCodexVersions | null>(null)
+const scanError = ref('')
+const scanning = ref(false)
+const activating = ref(false)
+const installations = computed(() => [
+  ...(localVersions.value?.managed || []).map(v => ({
+    ...v, source: t('managed_install'), systemPath: undefined, selectable: true,
+    active: status.value?.source === 'managed' && status.value.version === v.version,
+  })),
+  ...(localVersions.value?.system || []).map(v => ({
+    ...v, source: v.kind === 'binary' ? t('system_binary') : `${t('system_install')} · ${v.kind}`,
+    systemPath: v.path, active: status.value?.source === 'path' && status.value.systemPath === v.path,
+  })),
+])
+let scanRequest = 0
+const workspaces = ref<Workspace[]>([])
+const sessions = ref<SessionInfo[]>([])
+const selected = ref('')
+const fnos = ref(false)
+const appName = ref('')
+const refreshing = ref(false)
+const versionDialog = ref(false)
+const picking = ref(false)
+const statusError = ref('')
+const workspaceError = ref('')
+const sessionError = ref('')
+const confirmEnd = ref(false)
+const endTarget = ref<SessionInfo | null>(null)
+const canStart = computed(() => status.value?.installed && selected.value && !workspaceError.value)
+let disposed = false
+let pollTimer: number | undefined
 
-// 顶栏「标签页进入」的目标：当前访问环境下经飞牛网关访问 dsh 服务的地址。
-// 优先后端按请求头换算的结果（控制台访问源 + 控制台入口下的 /dsh/ 反代）；后端推不出
-// 时退回浏览器自身地址 —— document.baseURI 就是控制台当前地址，origin 拼上
-// consoleDshURL（/app/Harness/dsh/）即可。
-// 注意：`/app/Harness/dsh` 是**控制台 entry 下的子路径**（gatewayPrefix 仍是
-// /app/Harness、socket 仍是 app.sock），不是另一个 dsh 网关入口 —— 飞牛 App 的网关
-// 鉴权按入口注入，跨入口的凭据带不过去（会先看到 trim_http_cgi 的 invalid token）。
-const fnosEntry = computed(() => {
-  const fromServer = runtime.value?.fnosEntryURL || ''
-  if (fromServer) return fromServer
-  const consoleDsh = runtime.value?.consoleDshURL || ''
-  if (!consoleDsh || !document.baseURI) return ''
+async function loadStatus(afterInstall = false) {
+  window.clearTimeout(pollTimer)
   try {
-    return new URL(document.baseURI).origin + consoleDsh
-  } catch {
-    return ''
+    const wasInstalling = status.value?.installing
+    status.value = await api.status()
+    statusError.value = ''
+    if (!disposed && !status.value.installing && (wasInstalling || afterInstall)) void scanVersions()
+  } catch (err) {
+    statusError.value = uiErrText(err)
   }
-})
-
-// 「标签页进入」：桌面浏览器新标签页打开；飞牛 App 内用全屏 iframe 承载 dsh。
-//
-// 历史原因：早先 dsh 是**独立的网关入口**（另一个 gatewayPrefix + dsh.sock），
-// App 的网关鉴权按入口（gatewayPrefix）注入，控制台入口的凭据带不过去 ——
-// window.open 新建的 WebView 首个导航、以及同窗口 location.assign 都会被
-// trim_http_cgi 以 `200 + 13 字节 "invalid token"` 拒绝（实测）。
-//
-// 现在 dsh 已收进控制台入口之下的 /dsh/（由控制台的 app.sock 反代到 dsh，见
-// backend/admin.go 的 dshUI），跨入口问题从结构上消失；但 App 内仍保留 iframe
-// 承载：它留在控制台这个 WebView / 请求栈里，返回手势、重试面板与历史记录都好
-// 处理。若之后实测 App 内新标签页已能直接打开，可再简化这条路径。
-// 如果网关仍然拒绝（iframe 里出现 13 字节错误页），只显示一个全屏的重试面板。
-const entryFrameVisible = ref(false)
-const entryFrameUrl = ref('')
-const entryFrameError = ref(false)
-const entryFrameKey = ref(0)
-// 打开覆盖层时压入一条同 URL 的历史记录，返回手势/浏览器后退会把它弹掉 ——
-// 我们据此关闭覆盖层、回到控制台（而不是被 App 的返回手势直接带出控制台）。
-//
-// 飞牛 App / 桌面上的这一页是 portal 的 `/appview?anchor=…`（同一个文档里用 iframe 承载
-// 控制台），返回键的逻辑是「**挂载时**读一次 window.history.length，>1 就 history.back()，
-// 否则 navigate('/index')」（appview 的 createAppViewCloseHandler）。所以：
-//   - 这里 pushState 的是控制台自己的 window（= portal 里那个 iframe）。同源 iframe 的
-//     same-document 条目属于 joint session history：顶层 history.back() 会先把它弹掉，
-//     popstate 派发给我们这个 window，正好用来关覆盖层；再返回一次才回应用列表。
-//   - 那一次读数是闭包捕获的，之后再 pushState 也改不了它：若 App 把 `/appview` 当首个
-//     历史条目打开（length=1），返回键会直接 navigate('/index')，前端无从拦截。正常从
-//     应用列表点进来时 length ≥ 2，走的才是 history.back()。
-// App.vue 里那条「后退不切子页面」的守卫在 URL 未变时只是 replace 同一地址，不冲突。
-// dsh 内部自己的前进/后退发生在 iframe 的历史里（popstate 派发给 iframe 的 window），
-// 因此不会提前关掉覆盖层。
-let entryHistoryPushed = false
-
-function closeEntryFrame() {
-  entryFrameVisible.value = false
-  entryFrameError.value = false
-  entryFrameUrl.value = ''
-  entryHistoryPushed = false
+  if (!disposed && status.value?.installing) pollTimer = window.setTimeout(() => { void loadStatus() }, 1500)
 }
 
-function onEntryPopState() {
-  if (!entryFrameVisible.value) return
-  closeEntryFrame()
-}
-
-function normalizeEntryURL(url: string): string {
-  const u = url.trim()
-  if (!u) return ''
-  return /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(u) ? u : 'http://' + u
-}
-
-function openDshEntry() {
-  const final = normalizeEntryURL(fnosEntry.value)
-  if (!final) return
-  if (!isFnosApp()) {
-    window.open(final, '_blank', 'noopener')
-    return
-  }
-  entryFrameUrl.value = final
-  entryFrameError.value = false
-  entryFrameKey.value++
-  if (!entryHistoryPushed) {
-    // 同 URL 压栈：不改变当前页面，只是给返回手势一个「先关覆盖层」的落点。
-    const prevState = typeof history.state === 'object' && history.state ? history.state : {}
-    history.pushState({ ...prevState, harnessDshEntry: true }, '', location.href)
-    entryHistoryPushed = true
-  }
-  entryFrameVisible.value = true
-}
-
-function retryEntryFrame() {
-  entryFrameError.value = false
-  entryFrameKey.value++
-}
-
-function onEntryFrameLoad(ev: Event) {
-  const el = ev.target as HTMLIFrameElement
-  let text: string
+async function scanVersions(force = false) {
+  const request = ++scanRequest
+  scanning.value = true
+  scanError.value = ''
   try {
-    text = (el.contentDocument?.body?.innerText || '').trim()
-  } catch {
-    return // 理论上同源；读不到就不动
-  }
-  if (text === 'invalid token') {
-    entryFrameError.value = true
-  }
-}
-
-const visitors = ref<Visitor[]>([])
-const visitorsLoading = ref(false)
-const deleting = ref<string | null>(null)
-
-// dsh 是否在运行：状态未知（status 尚未拉到）时按「运行中」渲染，与旧版按钮逻辑一致
-// （旧版只在 running === false 时显示「启动」）。
-const running = computed(() => status.value?.running !== false)
-
-// 「DeepSeek 账号」卡片：桌面端（>=md）恒显示，移动端才受设置页的开关控制。
-// 判据用 useWideLayout()（就是 md 断点，与侧边栏 `hidden md:flex`、设置页那张
-// `md:hidden` 的控制台设置卡片严格互补），不另写宽度数值。
-// 注意这里是**卸载**卡片（v-if）而不是用 CSS 藏起来：卡片挂载时会拉一次账号快照，
-// 藏起来的卡片没必要继续请求后端。登录状态与账号数据都在 Pinia/后端，不受影响。
-const wideLayout = useWideLayout()
-const accountCardVisible = useAccountCardVisible()
-const showAccountCard = computed(() => wideLayout.value || accountCardVisible.value)
-
-// 停止/重启的二次确认弹窗：无论是否忙碌，每次点击都先弹窗确认
-const lifecycleAction = ref<'stop' | 'restart' | null>(null)
-const lifecycleDialogVisible = ref(false)
-
-// 停止/重启确认弹窗或 App 内的 dsh 全屏容器打开期间锁定页面滚动
-useBodyScrollLock(
-  () => lifecycleDialogVisible.value || entryFrameVisible.value
-)
-
-// 打开弹窗时顺便查一次「有没有插件操作在跑」：有的话弹窗里多显示一条风险提示
-// （停 dsh 会中断那次安装/卸载，并可能留下陈旧的 profile 写锁，之后插件列表与
-// 安装都会白等 120 秒）。这两个按钮刻意不硬挡 —— 点它是用户的即时意图。
-// 查询不阻塞弹窗：先显示，答案到了再补上提示；查不到（dsh 不可达）就不显示。
-type LifecycleBusy = { busy: boolean; source?: 'market' | 'console'; detail?: string }
-const lifecycleBusy = ref<LifecycleBusy | null>(null)
-
-function openLifecycleConfirm(action: 'stop' | 'restart') {
-  lifecycleAction.value = action
-  lifecycleDialogVisible.value = true
-  lifecycleBusy.value = null
-  api
-    .dshBusy()
-    .then((r) => {
-      // 期间用户可能已经确认/关闭了弹窗，避免把过期结果写回去
-      if (lifecycleDialogVisible.value) lifecycleBusy.value = r
-    })
-    .catch(() => {
-      lifecycleBusy.value = null
-    })
-}
-
-// 忙碌提示文案：按来源区分（市场面板的安装 vs 控制台的插件命令），并带上正在处理的对象。
-const lifecycleBusyText = computed(() => {
-  const b = lifecycleBusy.value
-  if (!b?.busy) return ''
-  const detail = b.detail?.trim() || ''
-  return b.source === 'console'
-    ? t('lifecycle_busy_console', { detail: detail || 'dsh plugin …' })
-    : t('lifecycle_busy_market', { detail: detail || t('lifecycle_busy_unknown_target') })
-})
-
-async function executeLifecycle(action: 'stop' | 'restart') {
-  if (action === 'stop') await store.stopDsh()
-  else await store.restartDsh()
-}
-
-function onLifecycleConfirm() {
-  const action = lifecycleAction.value
-  lifecycleAction.value = null
-  if (action) executeLifecycle(action)
-}
-
-// 格式化 CPU 使用率（%）/ 内存占用（MB）
-function fmtCpu(v?: number): string {
-  if (v === undefined || v === null || isNaN(v)) return '—'
-  return v.toFixed(1) + '%'
-}
-function fmtMem(v?: number): string {
-  if (v === undefined || v === null || isNaN(v)) return '—'
-  return v + ' MB'
-}
-// 格式化 dsh 进程 PID：进程未运行时后端返回 0（或字段缺失），统一显示「—」
-function fmtPid(v?: number): string {
-  if (v === undefined || v === null || isNaN(v) || v <= 0) return '—'
-  return String(v)
-}
-// 格式化进程运行时间：只取最大的两个单位（天+小时 / 小时+分 / 分+秒 / 秒），
-// 小面板一行放得下，也不会每秒都在跳数字。传 undefined（未运行 / 还没拿到基准）显示「—」。
-function fmtUptime(sec?: number): string {
-  if (sec === undefined || sec === null || isNaN(sec) || sec < 0) return '—'
-  const s = Math.floor(sec)
-  if (s < 60) return t('uptime_s', { s })
-  const m = Math.floor(s / 60)
-  if (m < 60) return t('uptime_m_s', { m, s: s % 60 })
-  const h = Math.floor(m / 60)
-  if (h < 24) return t('uptime_h_m', { h, m: m % 60 })
-  return t('uptime_d_h', { d: Math.floor(h / 24), h: h % 24 })
-}
-
-// --- 运行时间：基准只取「新鲜的一拍」，之后由前端自己走表 ---
-//
-// 状态流（/api/dsh/stream）每秒都会推 CPU / 内存，但**运行时间不跟着这些推送换算**：
-// 拿到一次基准值（该 PID 已运行的秒数）后，本机按时间差自己推进，后续每秒推来的秒数一律忽略。
-// 需要重新定基准的只有三种情况：dsh 启动/停止、重启（含装插件自重启，表现为 pid 变化），
-// 以及**从其他子页面切回概览后的第一拍推送** —— 见下面那段「踩过的坑」。
-//
-// 踩过的坑（这段逻辑存在的理由）：本页**不在** ViewSwitcher 的 KeepAlive 白名单里
-// （那里只缓存 TerminalView），切到别的子页面时本组件会被**卸载** —— SSE 连接随之关闭，
-// store 里的 status 冻结在「离开的那一刻」；切回来则是**重新挂载**。若直接拿 store 里那份
-// 旧快照当基准，计时就会从离开时的秒数接着走，表现为「切回来像暂停过、时间对不上」。
-// 因此进入页面后必须用第一拍**推送**重新定基准（SSE 连上时后端会立刻补发初始快照，
-// 见 backend/sse.go 的 handleDshStream）。
-//
-// 用本机时钟推进而不是每拍 +1：页面被切到后台时定时器会被节流，按真实时间差算回来才不会走慢。
-type UptimeBase = { pid: number; seconds: number; at: number }
-const uptimeBase = ref<UptimeBase | null>(null)
-const uptimeTick = ref(Date.now())
-let uptimeTimer: number | null = null
-// 是否还欠一次「用推送重定基准」：组件每次建立（含切回概览）都为 true。
-// 注意：本视图没有进 KeepAlive 的 include，切回来一定是重新挂载，初始值就够用；
-// 将来若把它加进 ViewSwitcher 的 keep-alive 名单，必须在 onActivated 里再置回 true。
-let needsReanchor = true
-
-// 采纳一份状态作为计时基准。fromPush 表示它来自 SSE 推送（新鲜数据）而不是 store 里的旧值。
-function adoptStatus(s: DshStatus | null, fromPush: boolean) {
-  const pid = s?.pid ?? 0
-  const up = s?.uptimeSeconds
-  // 未运行 / 后端读不到该 PID 的启动时刻 → 显示「—」，并等下次运行重新定基准
-  if (s?.running !== true || up === undefined) {
-    uptimeBase.value = null
-    needsReanchor = true
-    return
-  }
-  const samePid = uptimeBase.value !== null && uptimeBase.value.pid === pid
-  // 同一 PID 的常规状态：不采纳，展示值继续由本机秒表推进。
-  // 唯一例外是「刚进入页面后的第一拍推送」——store 里那份快照可能已经过期，必须用它纠正。
-  if (samePid && !(fromPush && needsReanchor)) return
-  uptimeBase.value = { pid, seconds: up, at: Date.now() }
-  if (fromPush) needsReanchor = false
-}
-
-// 展示值 = 基准秒数 + 本机已过去的秒数；没有基准（未运行 / 读不到）时 undefined → 「—」
-const uptimeSeconds = computed(() => {
-  const b = uptimeBase.value
-  if (!b) return undefined
-  return b.seconds + Math.max(0, Math.floor((uptimeTick.value - b.at) / 1000))
-})
-
-// 本页发起的启停 / 重启会写回 store.status：这里兜住「生命周期变化」（running 翻转 / pid 变化）。
-// 刚挂载时 store 里可能还是上次离开时的旧快照，先用它顶一下（避免数字闪成「—」），
-// needsReanchor 仍为 true，等第一拍推送到达即被纠正。
-watch(() => status.value, (cur) => adoptStatus(cur, false), { immediate: true })
-
-// CPU 占用阈值颜色：0-20% 绿 / 20-50% 橙 / 50% 以上红；未知用黑色（—）
-function cpuColor(v?: number): string {
-  if (v === undefined || v === null || isNaN(v)) return 'text-ink dark:text-[#EDEDF0]'
-  if (v < 20) return 'text-success-ink dark:text-[#10B981]'
-  if (v < 50) return 'text-warning-ink dark:text-[#F59E0B]'
-  return 'text-danger-ink'
-}
-// 内存阈值颜色：<500MB 绿 / 500-1000MB 橙 / 1000MB 以上红；未知用黑色（—）
-function memColor(v?: number): string {
-  if (v === undefined || v === null || isNaN(v)) return 'text-ink dark:text-[#EDEDF0]'
-  if (v < 500) return 'text-success-ink dark:text-[#10B981]'
-  if (v < 1000) return 'text-warning-ink dark:text-[#F59E0B]'
-  return 'text-danger-ink'
-}
-
-// 仅初次加载时显示“加载中…”，之后由 SSE 推送增量更新，避免文字闪烁
-async function initialLoad() {
-  visitorsLoading.value = true
-  try {
-    const p = await api.visitors()
-    visitors.value = p.visitors
-  } catch (e) {
-    toast.show(uiErrText(e, t('common_op_failed')), 'error')
+    const result = await api.localVersions(force)
+    if (disposed || request !== scanRequest) return
+    localVersions.value = result
+    scanError.value = result.error || ''
+    if (force) await loadStatus()
+  } catch (err) {
+    if (!disposed && request === scanRequest) scanError.value = uiErrText(err)
   } finally {
-    visitorsLoading.value = false
+    if (request === scanRequest) scanning.value = false
   }
 }
 
-// 通过 SSE 监听后端主动推送，替换高频轮询。
-// 用 useEventStream（断线自动重连）而不是裸 EventSource：断线后自行重连，重连
-// 成功时后端立刻补发初始快照，CPU/内存与登录列表随即恢复正常刷新。
-const visitorStream = useEventStream(() => sseUrl('/api/visitors/stream'), {
-  visitors: (data) => {
-    if (Array.isArray(data)) visitors.value = data as Visitor[]
-  }
-})
-
-// 通过 SSE 每 1 秒接收 dsh 运行状态（CPU 使用率 / 内存占用），实现自动刷新
-const statusStream = useEventStream(() => sseUrl('/api/dsh/stream'), {
-  status: (data) => {
-    const s = data as DshStatus
-    // 先按「推送」采纳计时基准（进入页面后的第一拍就是靠它纠正过期快照的），再写入 store
-    adoptStatus(s, true)
-    status.value = s
-  }
-})
-
-async function removeVisitor(id: string) {
-  deleting.value = id
+async function activate(version: string, systemPath?: string) {
+  if (activating.value || status.value?.installing) return
+  activating.value = true
   try {
-    const p = await api.deleteVisitor(id)
-    toast.show(uiText(p.msg, { code: p.msgCode }, p.deleted ? t('visitor_kicked_fallback') : ''), p.deleted ? 'success' : 'info')
-  } catch (e) {
-    toast.show(uiErrText(e, t('common_op_failed')), 'error')
+    await api.install(version, systemPath)
+    await loadStatus(true)
+  } catch (err) {
+    toast.show(uiErrText(err), 'error')
+    await Promise.all([loadStatus(), scanVersions()])
   } finally {
-    deleting.value = null
+    activating.value = false
   }
 }
 
+async function loadWorkspaces() {
+  try {
+    const result = await api.workspaces()
+    fnos.value = result.fnos
+    appName.value = result.appName
+    workspaces.value = result.workspaces || []
+    if (!workspaces.value.some((w) => w.path === selected.value)) selected.value = workspaces.value[0]?.path || ''
+    workspaceError.value = ''
+  } catch (err) {
+    workspaceError.value = uiErrText(err)
+  }
+}
+
+async function loadSessions() {
+  try {
+    sessions.value = (await api.sessions()).sessions || []
+    sessionError.value = ''
+  } catch (err) {
+    sessionError.value = uiErrText(err)
+  }
+}
+
+async function refresh() {
+  refreshing.value = true
+  await Promise.all([loadStatus(), scanVersions(), loadWorkspaces(), ...(terminalEnabled ? [loadSessions()] : [])])
+  refreshing.value = false
+}
+
+function installStarted() {
+  versionDialog.value = false
+  void loadStatus(true)
+}
+
+function start(mode: TerminalMode) {
+  if (!canStart.value) return
+  requestLaunch(selected.value, mode)
+  void router.replace({ path: '/', query: { view: 'terminal' } })
+}
+
+function openSession(session: SessionInfo) {
+  void router.replace({ path: '/', query: { view: 'terminal', id: session.id } })
+}
+
+function confirmSession(session: SessionInfo) {
+  endTarget.value = session
+  confirmEnd.value = true
+}
+
+async function endSession() {
+  const session = endTarget.value
+  if (!session) return
+  try {
+    await api.endSession(session.id)
+    await loadSessions()
+  } catch (err) {
+    toast.show(uiErrText(err), 'error')
+  }
+}
+
+function authorizeInBrowser() {
+  if (!appName.value) throw new Error(t('directory_appid_missing'))
+  const state = randomId()
+  rememberFnosAuthState(state)
+  window.location.replace(buildFnosAuthURL({ appName: appName.value, state, directory: true, redirectUri: fnosAuthReturnURL() }))
+}
+
+async function authorize() {
+  picking.value = true
+  try {
+    if (fnosAppNeedsWebDirectoryAuth()) {
+      authorizeInBrowser()
+      return
+    }
+    const sdk = await trimAppReady()
+    if (!sdk) throw new Error(t('directory_host_bridge_lost'))
+    if (sdk.isStandaloneWeb) {
+      authorizeInBrowser()
+      return
+    }
+    const result = await sdk.pickUserFile({
+      directory: true, title: t('directory_pick_title'), okText: t('directory_pick_ok'),
+      sidebarGroup: ['myFiles', 'external', 'favorites', 'team'],
+    })
+    if (result?.data?.length) await loadWorkspaces()
+  } catch (err) {
+    toast.show(uiErrText(err), 'error')
+  } finally {
+    picking.value = false
+  }
+}
 
 onMounted(() => {
-  store.load()
-  initialLoad()
-  visitorStream.start()
-  statusStream.start()
-  // 运行时间的本机秒表（见上面的 uptimeSeconds）：只在页面存活期间走，卸载时清掉
-  uptimeTimer = window.setInterval(() => {
-    uptimeTick.value = Date.now()
-  }, 1000)
-  window.addEventListener('popstate', onEntryPopState)
-})
-
-onBeforeUnmount(() => {
-  if (uptimeTimer !== null) {
-    clearInterval(uptimeTimer)
-    uptimeTimer = null
+  const result = readFnosAuthReturn()
+  if (result) {
+    const expected = takeFnosAuthState()
+    stripFnosAuthReturn()
+    if (!expected || expected !== result.state || result.status === 'error') toast.show(t('directory_auth_failed'), 'error')
+    else if (result.status === 'success') toast.show(t('directory_auth_success'), 'success')
   }
-  window.removeEventListener('popstate', onEntryPopState)
+  void refresh()
+})
+onBeforeUnmount(() => {
+  disposed = true
+  window.clearTimeout(pollTimer)
 })
 </script>
 
 <template>
-  <div class="pt-3 sm:pt-4 pb-8 sm:pb-12 px-4 sm:px-8 max-w-6xl mx-auto">
-    <!-- 页头（图标 + 标题 + 右侧操作，统一卡片式标题栏） -->
-    <PageHeader sticky class="mb-3" :title="t('overview_title')" :icon="icons.overview">
-      <!-- 拿不到网关入口（非网关部署）时不显示，避免给出指向站点根的错地址 -->
-      <button
-        v-if="fnosEntry"
-        class="g-btn-secondary h-8 px-3 text-xs"
-        @click="openDshEntry"
-      >{{ t('dsh_enter') }}</button>
-    </PageHeader>
+  <div class="max-w-4xl mx-auto px-4 sm:px-8 py-6 sm:py-12 space-y-5">
+    <header class="flex items-center justify-between gap-4 mb-7">
+      <h1 class="font-display text-2xl sm:text-3xl font-semibold tracking-tight">{{ t('version_management') }}</h1>
+      <button class="g-btn-secondary" :disabled="refreshing" @click="refresh">{{ t('refresh') }}</button>
+    </header>
 
-    <!-- 卡片栅格：dsh 信息与启停 / 三个版本 / DeepSeek 账号 / 登录列表。
-         桌面固定两列（见 style.css 的 .g-card-grid-2），四张卡片正好 2×2；
-         窄屏沿用 .g-card-grid 的自适应列数（手机为单列）。 -->
-    <div class="g-card-grid g-card-grid-2 g-fade-in">
-      <!-- ① dsh 服务信息与启停（「标签页进入」在页头顶栏右侧，不在卡片里） -->
-      <section class="g-card g-card-hover p-5 flex flex-col">
-        <div class="mb-4">
-          <h2 class="font-display text-base font-semibold text-ink dark:text-white">DeepSeek Harness</h2>
-          <p class="text-xs text-ink-faint dark:text-[#8A8A92] mt-1">{{ t('overview_dsh_desc') }}</p>
+    <section class="g-card p-5 sm:p-7">
+      <div class="flex flex-wrap items-center justify-between gap-4">
+        <div>
+          <h2 class="text-lg font-semibold">Codex CLI</h2>
+          <p class="mt-1 text-sm text-ink-soft dark:text-[#A6A6AD]" role="status">
+            {{ !status ? t('status_unknown') : status.installing ? t('installing') : status.installed ? status.version || t('installed') : t('not_installed') }}
+            <span v-if="status?.installed"> · {{ t(status.source === 'path' ? 'system_install' : 'managed_install') }}</span>
+          </p>
         </div>
+        <button class="g-btn-secondary" :disabled="!status || status.installing || activating" @click="versionDialog = true">
+          {{ t('install_from_registry') }}
+        </button>
+      </div>
+      <p v-if="statusError || status?.error" class="mt-3 text-sm text-danger-ink break-words" role="alert">{{ statusError || status?.error }}</p>
 
-        <!-- 进程信息：CPU / 内存 一行两个等宽小面板；PID 与运行时间折到下一行
-             （两列栅格放四个子项：后两个自然换行，并与上面两个等宽、左对齐）。 -->
-        <div class="grid grid-cols-2 gap-3 mb-4">
-          <div class="rounded-lg bg-black/[0.03] dark:bg-white/[0.05] px-3 py-2.5">
-            <div class="text-[11px] text-ink-soft dark:text-[#A6A6AD] mb-0.5">{{ t('cpu_usage') }}</div>
-            <div class="font-mono text-sm font-semibold" :class="cpuColor(status?.cpuPercent)">{{ fmtCpu(status?.cpuPercent) }}</div>
-          </div>
-          <div class="rounded-lg bg-black/[0.03] dark:bg-white/[0.05] px-3 py-2.5">
-            <div class="text-[11px] text-ink-soft dark:text-[#A6A6AD] mb-0.5">{{ t('mem_usage') }}</div>
-            <div class="font-mono text-sm font-semibold" :class="memColor(status?.memoryMB)">{{ fmtMem(status?.memoryMB) }}</div>
-          </div>
-          <div class="rounded-lg bg-black/[0.03] dark:bg-white/[0.05] px-3 py-2.5">
-            <div class="text-[11px] text-ink-soft dark:text-[#A6A6AD] mb-0.5">{{ t('dsh_pid') }}</div>
-            <div class="font-mono text-sm font-semibold text-ink dark:text-[#EDEDF0]">{{ fmtPid(status?.pid) }}</div>
-          </div>
-          <!-- 运行时间：后端只在打开/启停重启时给一次基准，之后由前端自己走表（未运行时「—」） -->
-          <div class="rounded-lg bg-black/[0.03] dark:bg-white/[0.05] px-3 py-2.5">
-            <div class="text-[11px] text-ink-soft dark:text-[#A6A6AD] mb-0.5">{{ t('dsh_uptime') }}</div>
-            <div class="font-mono text-sm font-semibold text-ink dark:text-[#EDEDF0]">{{ fmtUptime(uptimeSeconds) }}</div>
-          </div>
+      <div class="mt-5 border-t border-line pt-4 dark:border-[#2A2A32]">
+        <div class="flex flex-wrap items-center justify-between gap-2">
+          <h3 class="font-semibold">{{ t('local_installations') }}</h3>
+          <button class="g-btn-ghost" :disabled="scanning || activating || status?.installing" @click="scanVersions(true)">
+            {{ t(scanning ? 'scanning_versions' : 'rescan_versions') }}
+          </button>
         </div>
+        <p v-if="scanError" class="mt-2 break-words text-sm text-danger-ink" role="alert">{{ scanError }}</p>
+        <p v-if="localVersions && !installations.length && !scanError && !scanning" class="mt-2 text-sm text-ink-soft dark:text-[#A6A6AD]">
+          {{ t('no_local_installations') }}
+        </p>
+        <ul v-if="installations.length" class="mt-2 divide-y divide-line dark:divide-[#2A2A32]">
+          <li v-for="entry in installations" :key="entry.path" class="flex items-center justify-between gap-3 py-3">
+            <div class="min-w-0">
+              <div class="flex flex-wrap items-baseline gap-x-3 gap-y-1">
+                <span class="font-mono font-medium">{{ entry.version || t('unknown_version') }}</span>
+                <span class="text-xs text-ink-soft dark:text-[#A6A6AD]">{{ entry.source }}</span>
+              </div>
+              <p class="mt-1 select-text break-all font-mono text-xs text-ink-faint dark:text-[#8A8A92]">{{ entry.path }}</p>
+            </div>
+            <span v-if="entry.active" class="shrink-0 text-sm font-semibold">{{ t('current_version') }}</span>
+            <button v-else-if="entry.selectable" class="g-btn-secondary shrink-0" :disabled="activating || !status || status.installing || scanning"
+              :aria-label="t('activate_installation_at', { version: entry.version, path: entry.path })"
+              @click="activate(entry.version, entry.systemPath)">{{ t('activate_installation') }}</button>
+            <span v-else class="shrink-0 text-xs text-ink-faint dark:text-[#8A8A92]">{{ t('read_only_installation') }}</span>
+          </li>
+        </ul>
+      </div>
+    </section>
 
-        <!-- 启停操作：两列栅格，每个按钮的宽度与小面板一致（整行正好与上面的面板行同宽）。
-             停止时只剩「启动」，仍占第一列 —— 不要改成单列或 flex 撑满，否则按钮会被拉长；
-             「重启」对已停进程无意义，running === false 时隐藏。 -->
-        <div class="grid grid-cols-2 gap-3 mt-auto">
-          <!-- 启动按钮是实心绿底 + 白字：用 success-ink（浅色下 base 的 #16A34A
-               配白字只有 3.3:1），深色下 success-ink 就是原来的 #10B981。 -->
-          <button v-if="!running" class="g-btn-primary !h-9 !text-sm bg-success-ink hover:bg-success-ink/90" :disabled="loading" @click="store.startDsh()">{{ t('dsh_start') }}</button>
-          <button v-else class="g-btn-danger !h-9 !text-sm" :disabled="loading" @click="openLifecycleConfirm('stop')">{{ t('dsh_stop') }}</button>
-          <button v-if="running" class="g-btn-warning !h-9 !text-sm" :disabled="loading" @click="openLifecycleConfirm('restart')">{{ t('dsh_restart') }}</button>
+      <section class="g-card p-5 sm:p-7 space-y-4">
+        <div class="flex items-center justify-between gap-3">
+          <h2 class="text-lg font-semibold"><label for="project">{{ t('workspace') }}</label></h2>
+          <button v-if="fnos" class="g-btn-secondary" :disabled="picking" @click="authorize">{{ t('authorize') }}</button>
+        </div>
+        <p v-if="workspaceError" class="text-sm text-danger-ink break-words" role="alert">{{ workspaceError }}</p>
+        <select v-if="workspaces.length" id="project" v-model="selected" class="g-input w-full font-mono">
+          <option v-for="w in workspaces" :key="w.path" :value="w.path">{{ w.name && w.name !== w.path ? w.name + ' · ' : '' }}{{ w.path }}</option>
+        </select>
+        <p v-else-if="!refreshing && !workspaceError" class="text-sm text-ink-soft dark:text-[#A6A6AD]">{{ t('no_workspaces') }}</p>
+        <div v-if="terminalEnabled" class="flex flex-wrap gap-2">
+          <button class="g-btn-primary" :disabled="!canStart" @click="start('codex')">{{ t('start_codex') }}</button>
+          <button class="g-btn-secondary" :disabled="!canStart" @click="start('login')">{{ t('device_login') }}</button>
         </div>
       </section>
 
-      <!-- ② 三个版本：dsh 服务 / 插件市场 / 增强插件（控制台自身只能走 fpk 升级） -->
-      <UpdateSection />
-
-      <!-- ③ DeepSeek 官方账号：头像 / 余额 / 多账号管理（登录弹窗在卡片内部）。
-           移动端可在设置页关掉这张卡片（桌面端恒显示，见上面的 showAccountCard）。 -->
-      <AccountCard v-if="showAccountCard" />
-
-      <!-- ④ 登录列表：卡片自身负责排序、桌面端限高与来源标记 -->
-      <VisitorsCard
-        :visitors="visitors"
-        :loading="visitorsLoading"
-        :deleting-id="deleting"
-        @remove="removeVisitor"
-      />
-    </div>
-
-    <!-- 停止/重启确认弹窗 -->
-    <ConfirmDialog
-      v-model:visible="lifecycleDialogVisible"
-      :title="lifecycleAction === 'restart' ? t('confirm_restart_title') : t('confirm_stop_title')"
-      :confirm-text="t('confirm_ok')"
-      :cancel-text="t('confirm_cancel')"
-      danger
-      @confirm="onLifecycleConfirm"
-    >
-      <!-- 默认插槽：原确认文案 + （有插件操作在跑时）额外风险提示 -->
-      <p class="text-sm text-ink-soft dark:text-[#A6A6AD] leading-relaxed whitespace-pre-line" :class="lifecycleBusyText ? 'mb-3' : 'mb-6'">
-        {{ lifecycleAction === 'restart' ? t('confirm_restart_msg') : t('confirm_stop_msg') }}
-      </p>
-      <div
-        v-if="lifecycleBusyText"
-        class="mb-6 rounded-lg px-3 py-2 text-xs leading-relaxed bg-[#F59E0B]/10 dark:bg-[#F59E0B]/15 border border-[#F59E0B]/40 text-warning-ink dark:text-[#FBBF24]"
-      >
-        {{ lifecycleBusyText }}
-      </div>
-    </ConfirmDialog>
-
-    <!-- App 内的全屏 dsh 容器：走控制台 WebView 的请求栈，避免新 WebView 的入口凭据缺失。
-         按要求不保留顶栏：没有「在浏览器打开」，也没有返回控制台的按钮。 -->
-    <Teleport to="body">
-      <div v-if="entryFrameVisible" class="fixed inset-0 z-[200] bg-bg dark:bg-[#0B0B0F]">
-        <div v-if="entryFrameError" class="h-full flex items-center justify-center p-6">
-          <div class="g-card p-5 w-full max-w-sm text-center">
-            <p class="text-sm text-ink-soft dark:text-[#A6A6AD] leading-relaxed">{{ t('dsh_enter_blocked') }}</p>
-            <div class="flex items-center justify-center gap-2 mt-4">
-              <button class="g-btn-secondary" @click="retryEntryFrame">{{ t('dsh_enter_retry') }}</button>
+      <section v-if="terminalEnabled" class="g-card p-5 sm:p-7">
+        <h2 class="mb-4 text-lg font-semibold">{{ t('sessions') }}</h2>
+        <p v-if="sessionError" class="text-sm text-danger-ink break-words" role="alert">{{ sessionError }}</p>
+        <p v-else-if="!sessions.length && !refreshing" class="text-sm text-ink-soft dark:text-[#A6A6AD]">{{ t('no_sessions') }}</p>
+        <ul class="divide-y divide-line dark:divide-[#2A2A32]">
+          <li v-for="s in sessions" :key="s.id" class="flex flex-wrap items-center justify-between py-3 gap-3">
+            <div class="min-w-0">
+              <p class="font-medium break-all">{{ s.workspace }}</p>
+              <p class="text-xs text-ink-faint dark:text-[#8A8A92]">{{ s.mode === 'login' ? t('device_login') : 'Codex CLI' }} · {{ new Date(s.created).toLocaleString(locale) }} · {{ t(s.exited ? 'exited' : 'running') }}</p>
             </div>
-          </div>
-        </div>
-        <iframe
-          v-else
-          :key="entryFrameKey"
-          :src="entryFrameUrl"
-          class="w-full h-full border-0 bg-white dark:bg-[#0B0B0F]"
-          @load="onEntryFrameLoad"
-        ></iframe>
-      </div>
-    </Teleport>
+            <div class="flex gap-2">
+              <button class="g-btn-secondary" @click="openSession(s)">{{ t(s.exited ? 'view_output' : 'resume') }}</button>
+              <button class="g-btn-danger" @click="confirmSession(s)">{{ t(s.exited ? 'delete_session' : 'end_session') }}</button>
+            </div>
+          </li>
+        </ul>
+      </section>
+
+    <CodexVersionDialog v-if="versionDialog" :current-version="status?.source === 'managed' ? status.version : ''"
+      @close="versionDialog = false" @started="installStarted" />
+    <ConfirmDialog v-model:visible="confirmEnd" :title="t(endTarget?.exited ? 'delete_session' : 'end_session')"
+      :message="t('end_session_hint', { path: endTarget?.workspace || '' })" :cancel-text="t('cancel')" :confirm-text="t(endTarget?.exited ? 'delete_session' : 'end_session')" danger @confirm="endSession" />
   </div>
 </template>

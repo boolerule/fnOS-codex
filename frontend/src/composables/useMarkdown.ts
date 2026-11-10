@@ -10,6 +10,7 @@
 // 开启 GFM 与 breaks：单换行按 <br> 展示，与现有“保留换行”的日志观感一致。
 
 import { Marked } from 'marked'
+import DOMPurify from 'dompurify'
 
 // 转义 HTML 特殊字符，作为一切外部文本进入 HTML 的兜底。
 function escapeHtml(s: string): string {
@@ -58,5 +59,12 @@ const markdown = new Marked(
 // 把 Markdown 源文本渲染成安全的 HTML 字符串（供 v-html 使用）。
 export function renderMarkdown(source: string): string {
   if (!source) return ''
-  return markdown.parse(source, { async: false })
+  const html = markdown.parse(source, { async: false })
+  return DOMPurify.sanitize(html, {
+    ALLOWED_TAGS: ['a', 'p', 'br', 'strong', 'em', 'del', 'ul', 'ol', 'li', 'blockquote', 'hr',
+      'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'pre', 'code', 'table', 'thead', 'tbody', 'th', 'tr', 'td'],
+    ALLOWED_ATTR: ['href', 'title', 'target', 'rel', 'start'],
+    ALLOWED_URI_REGEXP: SAFE_PROTOCOL_RE,
+    ALLOW_DATA_ATTR: false,
+  })
 }

@@ -7,12 +7,10 @@ import { ClipboardAddon } from '@xterm/addon-clipboard'
 import '@xterm/xterm/css/xterm.css'
 import { useI18n } from '@/composables/useI18n'
 import { useTheme } from '@/composables/useTheme'
-import { useQuickCmds } from '@/composables/useQuickCmds'
+import { useRoute, useRouter } from 'vue-router'
+import { takeLaunch } from '@/composables/useTerminalLaunch'
 import { useToastStore } from '@/stores/toast'
-import { api } from '@/serverapi'
-import ConfirmDialog from '@/components/ConfirmDialog.vue'
-import QuickCmdsDialog from '@/components/QuickCmdsDialog.vue'
-import QuickCmdEditDialog from '@/components/QuickCmdEditDialog.vue'
+import { api, runtimeBase } from '@/serverapi'
 import KeypadBar from '@/components/KeypadBar.vue'
 import PageHeader from '@/components/PageHeader.vue'
 import { icons } from '@/utils/icons'
@@ -21,6 +19,11 @@ import { copyText } from '@/utils/clipboard'
 defineOptions({ name: 'TerminalView' })
 const { t } = useI18n()
 const toast = useToastStore()
+const route = useRoute()
+const router = useRouter()
+const active = ref(false)
+const exited = ref(false)
+let launch: ReturnType<typeof takeLaunch> = null
 const { isDark } = useTheme() // 终端配色跟随控制台浅色/深色切换
 
 // ---------- xterm 主题配色（随控制台主题切换） ----------
@@ -75,15 +78,12 @@ const LIGHT_PALETTE = {
 
 const el = ref<HTMLElement | null>(null)
 const wsProtocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
-const basePath = document.baseURI ? new URL(document.baseURI).pathname.replace(/\/$/, '') : ''
-const wsEndpoint = basePath + '/terminal'
+const wsEndpoint = runtimeBase() + '/terminal'
 
 // 后端会话 id：新建会话在 WS 控制帧 \x1b]id;<id>\x07 回填；
 // 恢复历史时从 /api/sessions 取得非退出会话的 id 并以 ?id= 挂载回放。
 const sessionId = ref<string | null>(null)
 
-// 会话不存在标记：收到 "session not found" 后丢弃旧 id，连接关闭时自动重建
-let recreateOnClose = false
 
 // 会话被其他设备接管（单挂载点）：后端先发该控制帧，再以 WS_CLOSE_DETACHED 关闭连接
 // （双保险：帧可能被代理吞掉，故 close 码也要判）。与 backend/terminal.go 的
@@ -109,7 +109,6 @@ let heartbeatTimer: number | null = null
 let resizeObserver: ResizeObserver | null = null
 let resizeTimeout: number | null = null
 let fitRetryTimer: number | null = null
-let onPasteEvent: ((ev: ClipboardEvent) => void) | null = null
 let toastTimer: number | null = null
 
 // 修饰键
@@ -131,40 +130,14 @@ const TOUCH_SCROLL_MIN = 10
 let touchLastY = 0
 let touchScrolling = false
 
-// 快捷指令：状态与持久化在 useQuickCmds 里，这里只注入「往终端写」的三个动作。
-// 组件模板沿用原有变量名，避免大段改模板。
-const {
-  commands: quickCmds,
-  loading: cmdLoading,
-  failed: cmdFailed,
-  listVisible: quickCmdsVisible,
-  editVisible,
-  editing: editingCmd,
-  deleteVisible: deleteDialogVisible,
-  deleteTarget,
-  open: openQuickCmds,
-  reload: loadQuickCmds,
-  run: runQuickCmd,
-  startAdd: onQuickCmdAdd,
-  startEdit: onQuickCmdEdit,
-  startDelete: onQuickCmdDelete,
-  confirmDelete: confirmDeleteQuickCmd,
-  save: onQuickCmdSave,
-  reorder: onQuickCmdReorder
-} = useQuickCmds({
-  send: (data) => {
-    if (!sock || sock.readyState !== WebSocket.OPEN) return false
-    sock.send(data)
-    return true
-  },
-  focusTerminal: () => term?.focus(),
-  scrollToBottom: () => scrollToBottom()
-})
-
 function wsUrl(): string {
   const u = new URL(wsEndpoint, location.href)
   u.protocol = wsProtocol
   if (sessionId.value) u.searchParams.set('id', sessionId.value)
+  else if (launch) {
+    u.searchParams.set('mode', launch.mode)
+    u.searchParams.set('workspace', launch.workspace)
+  }
   return u.toString()
 }
 
@@ -314,7 +287,7 @@ function showPasteMenu() {
   const onPaste = (ev: ClipboardEvent) => {
     const text = ev.clipboardData?.getData('text/plain')
     if (text && sock && sock.readyState === WebSocket.OPEN) {
-      sock.send(text)
+      term?.paste(text)
       term?.focus()
     }
     cleanup()
@@ -469,20 +442,9 @@ onMounted(() => {
     window.addEventListener('resize', debouncedFit)
   }
 
-  // 桌面端原生粘贴：Ctrl+Shift+V / 右键粘贴 触发 paste 事件时直接发送到终端
-  onPasteEvent = (ev: ClipboardEvent) => {
-    if (!sock || sock.readyState !== WebSocket.OPEN) return
-    const text = ev.clipboardData?.getData('text/plain')
-    if (text) {
-      ev.preventDefault()
-      sock.send(text)
-      scrollToBottom()
-    }
-  }
-  el.value.addEventListener('paste', onPasteEvent)
+  // Native paste is handled by xterm, including the CLI bracketed-paste mode.
 
-  // 先恢复会话（若有未退出的活动会话则以 ?id= 挂载回放历史），再建立 WebSocket
-  restoreSession().then(() => connect())
+  activateTerminal()
 
   term.onData((data) => {
     if (!sock || sock.readyState !== WebSocket.OPEN) return
@@ -522,32 +484,23 @@ onMounted(() => {
 
 // 处理来自后端的数据：剥离会话控制帧（\x1b]id;、\x1b]ready\x07、\x1b]exit\x07、
 // \x1b]detached\x07），其余内容写入终端。
-function handleData(raw: string) {
-  if (!raw) return
-  let rest = raw
-  // eslint-disable-next-line no-control-regex -- OSC 控制帧本身含 ESC/BEL
-  rest = rest.replace(/\x1b\]id;([0-9a-f]+)\x07/g, (_, id: string) => {
+function handleControl(raw: string) {
+  // Only text frames carry control messages. Binary frames are raw PTY bytes.
+  // eslint-disable-next-line no-control-regex -- OSC uses ESC and BEL.
+  const id = /^\x1b\]id;([0-9a-f]+)\x07$/.exec(raw)?.[1]
+  if (id) {
     sessionId.value = id
-    return ''
-  })
-  // eslint-disable-next-line no-control-regex -- OSC 控制帧本身含 ESC/BEL
-  rest = rest.replace(/\x1b\]ready\x07/g, () => '')
-  // 被其他设备接管：用常量做纯字符串匹配（帧本身含 ESC/]，不必拼正则）
-  if (rest.includes(DETACHED_PAYLOAD)) {
-    rest = rest.split(DETACHED_PAYLOAD).join('')
+    launch = null
+    if (route.query.view === 'terminal') {
+      void router.replace({ path: '/', query: { view: 'terminal', id } })
+    }
+  } else if (raw === DETACHED_PAYLOAD) {
     markDetached()
-  }
-  // eslint-disable-next-line no-control-regex -- OSC 控制帧本身含 ESC/BEL
-  rest = rest.replace(/\x1b\]exit\x07/g, () => '')
-  // 会话已不存在（如后端重启）：丢弃旧 id，稍后自动重建新会话
-  if (rest.includes('session not found')) {
-    recreateOnClose = true
-    sessionId.value = null
-    rest = '\r\n\x1b[33m' + t('term_conn_closed') + '\x1b[0m\r\n'
-  }
-  if (rest) {
-    term?.write(rest)
-    scrollToBottom()
+  } else if (raw === '\x1b]exit\x07') {
+    exited.value = true
+    stopHeartbeat()
+  } else if (raw !== '\x1b]ready\x07') {
+    term?.write(raw)
   }
 }
 
@@ -566,22 +519,24 @@ function markDetached() {
 // 建立 WebSocket：sessionId 为空则新建会话（后端回 \x1b]id;<id>\x07 回填），
 // 否则以 ?id= 挂载已有会话（后端回放历史 + \x1b]ready\x07 后进入实时流）。
 function connect() {
-  if (!el.value) return
+  if (!el.value || (!sessionId.value && !launch)) return
   disconnect()
+  active.value = true
+  exited.value = false
   // 重新建立连接即视为重新参与（可能是一次显式夺回）
   detached = false
   sock = new WebSocket(wsUrl())
   sock.binaryType = 'arraybuffer'
 
   sock.onopen = () => {
-    // 连接建立后重新 fit 并同步 PTY 尺寸，确保后端 bash 的 cols/rows 与
+    // 连接建立后重新 fit 并同步 PTY 尺寸，确保后端 Codex 的 cols/rows 与
     // 前端渲染一致，避免换行错位、命令重叠。
     fitAndResize()
     startHeartbeat()
   }
   sock.onmessage = (ev) => {
-    const data = typeof ev.data === 'string' ? ev.data : new TextDecoder().decode(ev.data)
-    handleData(data)
+    if (typeof ev.data === 'string') handleControl(ev.data)
+    else term?.write(new Uint8Array(ev.data))
   }
   sock.onclose = (ev: CloseEvent) => {
     stopHeartbeat()
@@ -594,11 +549,7 @@ function connect() {
     // 已因 \x1b]detached\x07 进入 detached（关闭码被中间代理改写时走不到上面那条），
     // 不再叠一条通用的「连接已关闭」
     if (detached) return
-    if (recreateOnClose) {
-      recreateOnClose = false
-      connect()
-      return
-    }
+    if (exited.value) return
     term?.writeln('\r\n\x1b[31m' + t('term_conn_closed') + '\x1b[0m')
     scrollToBottom()
   }
@@ -623,19 +574,6 @@ function disconnect() {
   }
 }
 
-// 启动时恢复会话：列出后端活动会话，取第一个未退出的会话 id 以 ?id= 挂载，
-// 从而回放其历史消息；无会话则新建。
-async function restoreSession() {
-  try {
-    const res = await api.sessions()
-    const list = res.sessions || []
-    const live = list.find((s) => !s.exited)
-    if (live) sessionId.value = live.id
-  } catch (e) {
-    console.warn('restore sessions error:', e)
-  }
-}
-
 // 控制台主题（浅色/深色/跟随系统）切换时，实时更新终端底色与字体色
 watch(
   () => isDark.value,
@@ -645,7 +583,24 @@ watch(
 )
 
 // 页面切换回来时（KeepAlive 激活）：重新适配尺寸、滚动到底部
+let viewActive = false
+function activateTerminal() {
+  if (viewActive) return
+  viewActive = true
+  const requested = takeLaunch()
+  const id = typeof route.query.id === 'string' ? route.query.id : null
+  if (requested || (id && (id !== sessionId.value || sock?.readyState !== WebSocket.OPEN))) {
+    disconnect()
+    term?.reset()
+    launch = requested
+    sessionId.value = requested ? null : id
+    connect()
+  } else if (!id && sessionId.value) {
+    void router.replace({ path: '/', query: { view: 'terminal', id: sessionId.value } })
+  }
+}
 onActivated(() => {
+  activateTerminal()
   nextTick(() => {
     requestAnimationFrame(fitAndResize)
     scrollToBottom()
@@ -654,6 +609,7 @@ onActivated(() => {
 
 // 页面切走时：释放长按粘贴等临时资源
 onDeactivated(() => {
+  viewActive = false
   if (fitRetryTimer) {
     clearTimeout(fitRetryTimer)
     fitRetryTimer = null
@@ -673,10 +629,6 @@ onBeforeUnmount(() => {
   if (fitRetryTimer) {
     clearTimeout(fitRetryTimer)
     fitRetryTimer = null
-  }
-  if (onPasteEvent && el.value) {
-    el.value.removeEventListener('paste', onPasteEvent)
-    onPasteEvent = null
   }
   disconnect()
   if (resizeObserver) {
@@ -724,7 +676,7 @@ async function pasteClipboard() {
   try {
     const text = await navigator.clipboard.readText()
     if (text) {
-      sock.send(text)
+      term.paste(text)
       term.focus()
       scrollToBottom()
     }
@@ -768,12 +720,15 @@ function showToast(msg: string) {
       <!-- 工具栏（与其他子页面一致的卡片式标题栏；标题栏按钮统一样式：
            小一号字号 + 细边框 + 不填充底色） -->
       <PageHeader :title="t('terminal_title')" :icon="icons.terminal">
-        <button class="g-btn-secondary h-8 px-3 text-xs" :title="t('term_quick_cmds')" @click="openQuickCmds">{{ t('term_quick_cmds') }}</button>
         <button class="g-btn-secondary h-8 px-3 text-xs" :title="t('term_paste')" @click="pasteClipboard">{{ t('term_paste') }}</button>
-        <button class="g-btn-secondary h-8 px-3 text-xs" @click="reconnect">{{ t('term_reconnect') }}</button>
+        <button :disabled="!sessionId || exited" class="g-btn-secondary h-8 px-3 text-xs" @click="reconnect">{{ t('term_reconnect') }}</button>
         <button class="g-btn-secondary h-8 px-3 text-xs" @click="clearTerminal">{{ t('term_clear') }}</button>
       </PageHeader>
 
+      <div v-if="!active" class="g-card px-5 py-4 flex flex-wrap gap-3 items-center justify-between">
+        <p class="text-sm">{{ t('select_session') }}</p>
+        <button class="g-btn-secondary" @click="router.replace({ path: '/', query: { view: 'overview' } })">{{ t('nav_overview') }}</button>
+      </div>
       <!-- 终端卡片：外框由这张卡片负责（圆角 + 边框 + 撑满剩余高度），终端底色铺满整张卡片。
            内缩留白（左 / 下各 10px）放在卡片内的 padding 层上，绝不能放到下面 xterm 挂载容器自身
            的 border / padding 上 —— FitAddon 按挂载点父元素 computedStyle 的 height/width
@@ -810,35 +765,4 @@ function showToast(msg: string) {
     />
   </div>
 
-  <!-- 快捷指令列表弹窗 -->
-  <QuickCmdsDialog
-    v-model:visible="quickCmdsVisible"
-    :commands="quickCmds"
-    :loading="cmdLoading"
-    :failed="cmdFailed"
-    @add="onQuickCmdAdd"
-    @edit="onQuickCmdEdit"
-    @delete="onQuickCmdDelete"
-    @run="runQuickCmd"
-    @reorder="onQuickCmdReorder"
-    @retry="loadQuickCmds"
-  />
-
-  <!-- 新增 / 编辑快捷指令弹窗 -->
-  <QuickCmdEditDialog
-    v-model:visible="editVisible"
-    :cmd="editingCmd"
-    @save="onQuickCmdSave"
-  />
-
-  <!-- 删除快捷指令确认 -->
-  <ConfirmDialog
-    v-model:visible="deleteDialogVisible"
-    :title="t('qc_delete_confirm_title')"
-    :message="t('qc_delete_confirm_msg', { name: deleteTarget?.name || '' })"
-    :confirm-text="t('confirm_delete')"
-    :cancel-text="t('confirm_cancel')"
-    danger
-    @confirm="confirmDeleteQuickCmd"
-  />
 </template>

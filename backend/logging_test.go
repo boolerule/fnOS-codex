@@ -2,14 +2,12 @@ package main
 
 import (
 	"bytes"
-	"context"
-	"net/http"
-	"net/http/httptest"
+
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
+
 	"unicode"
 )
 
@@ -46,7 +44,7 @@ func TestLogLevelTags(t *testing.T) {
 		}
 	}
 	for _, line := range strings.Split(strings.TrimRight(got, "\n"), "\n") {
-		if !strings.HasPrefix(line, "[Harness] ") {
+		if !strings.HasPrefix(line, "[Codex Console] ") {
 			t.Fatalf("日志行缺少固定前缀: %q", line)
 		}
 	}
@@ -65,11 +63,11 @@ func TestLogPercentEscape(t *testing.T) {
 func TestLogRepeatSuppression(t *testing.T) {
 	out, _ := captureLogs(t)
 	for i := 0; i < 5; i++ {
-		logInfo("dsh pid changed: tracked=%d -> live=%d", 1, 2)
+		logInfo("terminal pid changed: tracked=%d -> live=%d", 1, 2)
 	}
 	logInfo("next message")
 	got := out.String()
-	if n := strings.Count(got, "dsh pid changed"); n != 2 { // 1 条正文 + 1 条汇总行回显
+	if n := strings.Count(got, "terminal pid changed"); n != 2 { // 1 条正文 + 1 条汇总行回显
 		t.Fatalf("重复行未被抑制（出现 %d 次）:\n%s", n, got)
 	}
 	if !strings.Contains(got, "(previous message repeated 4 times)") {
@@ -110,34 +108,6 @@ func TestLogRepeatIsLevelSensitive(t *testing.T) {
 }
 
 // dsh 子进程输出：原样透传（不加前缀、不做重复抑制），只有终端才加黄色。
-func TestDshLogWriterPassthrough(t *testing.T) {
-	out, _ := captureLogs(t)
-	w := dshLogWriter{}
-	line := "dsh: skipping profile bundle \"@x/y\": Error: incompatible\n"
-	for i := 0; i < 3; i++ {
-		if _, err := w.Write([]byte(line)); err != nil {
-			t.Fatalf("写入失败: %v", err)
-		}
-	}
-	if got := out.String(); got != strings.Repeat(line, 3) {
-		t.Fatalf("dsh 输出被改动:\n%q", got)
-	}
-
-	// 终端模式：整体包一层黄色，内容本身不变。
-	s := logs
-	s.mu.Lock()
-	s.color = true
-	s.mu.Unlock()
-	out.Reset()
-	if _, err := w.Write([]byte(line)); err != nil {
-		t.Fatalf("写入失败: %v", err)
-	}
-	if got := out.String(); got != ansiYellow+line+ansiReset {
-		t.Fatalf("dsh 输出着色不符: %q", got)
-	}
-}
-
-// 日志文件里不写 ANSI：等级靠 [LEVEL] 标记，供控制台着色。
 func TestLogFileHasNoAnsi(t *testing.T) {
 	out, file := captureLogs(t)
 	s := logs
@@ -229,68 +199,6 @@ func matchCallEnd(src string, open int) int {
 		}
 	}
 	return -1
-}
-
-// 会进日志的错误串必须是英文。这些生产者都是「诊断型」错误（不是给用户看的话术），
-// 因此日志里保留原文即可，不需要中文。新增这类生产者时把它加进表里。
-func TestLoggedErrorsAreEnglish(t *testing.T) {
-	t.Run("fetchMirrorPackument", func(t *testing.T) {
-		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// 元数据不是合法 JSON：走「解析元数据失败」那条
-			_, _ = w.Write([]byte("{not json"))
-		}))
-		defer srv.Close()
-		_, _, err := fetchMirrorPackument(srv.Client(), srv.URL, dshPackageName)
-		requireASCIIErr(t, "fetchMirrorPackument", err)
-	})
-
-	t.Run("verifyInstall", func(t *testing.T) {
-		dataDir := t.TempDir()
-		prevCfg := GetConfig()
-		initConfig(&AppConfig{})
-		t.Cleanup(func() { initConfig(&prevCfg) })
-		renv := &RuntimeEnv{DataDir: dataDir}
-		dsh := &DshManager{renv: renv, logf: func(logLevel, string, ...interface{}) {}}
-		upd := &UpdateManager{renv: renv, dsh: dsh, statuses: map[updateKind]*UpdateStatus{}}
-		srv := newServerManager(renv, dsh, upd)
-		// 版本目录里没有可执行的 dsh → 报错（这条会被 logWarn 打到日志）
-		requireASCIIErr(t, "verifyInstall", srv.verifyInstall(context.Background(), "9.9.9"))
-	})
-
-	t.Run("patchAttachmentFsync", func(t *testing.T) {
-		dataDir := t.TempDir()
-		renv := &RuntimeEnv{DataDir: dataDir}
-		srv := newServerManager(renv, &DshManager{renv: renv, logf: func(logLevel, string, ...interface{}) {}}, nil)
-		// 包里没有 attachment-local 产物 → 报错（同样会被 logWarn 打到日志）
-		requireASCIIErr(t, "patchAttachmentFsync", srv.patchAttachmentFsync(filepath.Join(dataDir, "server", "1.0.0")))
-	})
-
-	t.Run("dshBinPath", func(t *testing.T) {
-		prevCfg := GetConfig()
-		initConfig(&AppConfig{})
-		t.Cleanup(func() { initConfig(&prevCfg) })
-		dsh := &DshManager{renv: &RuntimeEnv{DataDir: t.TempDir()}, logf: func(logLevel, string, ...interface{}) {}}
-		_, err := dsh.dshBinPath()
-		requireASCIIErr(t, "dshBinPath", err)
-	})
-
-	t.Run("runDshCmdTimeout", func(t *testing.T) {
-		f := newPluginCmdFixture(t)
-		// 假 dsh 会 sleep 0.3s：给 50ms 超时必定走到「超时」那条错误
-		_, err := f.dsh.RunPluginCommand(50*time.Millisecond, marketCommand([]string{"list"}))
-		requireASCIIErr(t, "runDshCmdTimeout timeout", err)
-	})
-}
-
-// requireASCIIErr 断言 err 非空且文本是纯 ASCII。
-func requireASCIIErr(t *testing.T, what string, err error) {
-	t.Helper()
-	if err == nil {
-		t.Fatalf("%s 应返回错误，实得 nil", what)
-	}
-	if !isASCII(err.Error()) {
-		t.Fatalf("%s 的错误会进日志，必须是英文，实得: %s", what, err.Error())
-	}
 }
 
 // isASCII 报告字符串是否只含 ASCII 字符。

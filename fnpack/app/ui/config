@@ -1,0 +1,17 @@
+{
+  ".url": {
+    "CodexTerminal.main": {
+      "title": "Codex 工作台",
+      "icon": "images/icon_{0}.png",
+      "type": "iframe",
+      "protocol": "",
+      "gatewayPrefix": "/app/CodexTerminal",
+      "gatewaySocket": "app.sock",
+      "url": "/app/CodexTerminal/",
+      "allUsers": false,
+      "control": {
+        "accessPerm": "readonly"
+      }
+    }
+  }
+}

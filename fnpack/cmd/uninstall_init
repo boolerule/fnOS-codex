@@ -1,0 +1,31 @@
+#!/bin/sh
+set -eu
+
+case "${wizard_codex_cleanup:-keep}" in
+    keep) exec /bin/sh "$(dirname "$0")/main" stop ;;
+    remove) ;;
+    *) echo "未知的 Codex 清理选项。" >&2; exit 1 ;;
+esac
+
+# The uninstall helper and the dependent runtime run as the package account.
+if [ "${TRIM_APP_STATUS:-}" != UNINSTALL ] || [ "${TRIM_APPNAME:-}" != CodexTerminal ]; then
+    echo "仅在卸载 Codex 工作台时允许清理 CLI。" >&2
+    exit 1
+fi
+uid=$(/bin/id -u)
+if [ "$uid" = 0 ]; then
+    echo "同步清理需要以工作台应用账户运行。" >&2
+    exit 1
+fi
+/bin/sh "$(dirname "$0")/main" stop
+export CODEX_CONSOLE_DATA="${TRIM_PKGVAR:?}" HOME="${TRIM_PKGHOME:-$TRIM_PKGVAR/home}"
+export PATH="/var/apps/nodejs_v24/target/bin:${PATH:-/usr/bin:/bin}"
+unset CODEX_CONSOLE_LISTEN CODEX_CONSOLE_PASSWORD
+if message=$("${TRIM_APPDEST:?}/bin/codex-console" uninstall-system-codex 2>&1); then
+    exit 0
+fi
+printf '%s\n' "$message" >&2
+if [ -n "${TRIM_TEMP_LOGFILE:-}" ]; then
+    printf '%s\n' "$message" > "$TRIM_TEMP_LOGFILE"
+fi
+exit 1
